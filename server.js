@@ -1,3 +1,8 @@
+// server.js
+// Express BFF for HubSpot (ES modules). Creates/updates a Contact,
+// and (optionally) creates a standalone Task from `appointment.startISO`.
+// No task associations are created.
+
 import express from "express";
 import axios from "axios";
 import cors from "cors";
@@ -35,9 +40,13 @@ app.use(
   })
 );
 
+// HubSpot client
 const hs = axios.create({
   baseURL: "https://api.hubapi.com",
-  headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+  headers: {
+    Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+    "Content-Type": "application/json"
+  },
   timeout: 15000
 });
 
@@ -45,11 +54,13 @@ const hs = axios.create({
 async function findContactByEmail(email) {
   const res = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
-    properties: ["email", "firstname", "lastname"]
+    properties: ["email", "firstname", "lastname", "phone"],
+    limit: 1
   });
   return res.data?.results?.[0] || null;
 }
 
+// (optional) notes helper kept here if you still use /api/hubspot/notes
 async function createNoteForContact(contactId, title, body) {
   const noteRes = await hs.post("/crm/v3/objects/notes", {
     properties: { hs_note_body: body, hs_note_title: title }
@@ -61,78 +72,78 @@ async function createNoteForContact(contactId, title, body) {
   return noteId;
 }
 
-// Create a standalone Task (no associations)
-// hs_task_subject = title, hs_timestamp = due date/time
-async function createTask({ subject, dueISO, body, status = "NOT_STARTED", priority = "MEDIUM", ownerId }) {
-  const properties = {
-    hs_task_subject: subject,
-    hs_timestamp: dueISO,
-    hs_task_body: body || "",
-    hs_task_status: status,
-    hs_task_priority: priority
-  };
-  if (ownerId) properties.hubspot_owner_id = ownerId;
-
-  const r = await hs.post("/crm/v3/objects/tasks", { properties });
-  return r.data; // { id, properties ... }
-}
-
 // ---------- Routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Upsert contact by email; if appointment.startISO exists, also create a Task (no association)
+// Upsert contact by email. If `appointment.startISO` is present, also create a standalone Task (no associations)
 app.post("/api/hubspot/contacts", async (req, res) => {
   try {
-    const { email, firstname, lastname, phone, firstName, lastName, appointment, ...restProps } = req.body || {};
+    // DO NOT forward 'appointment' into HubSpot contact properties.
+    const { email, firstname, lastname, phone, firstName, lastName, appointment } = req.body || {};
     if (!email) return res.status(400).json({ error: "Missing email" });
 
-    // Normalize name props
+    // Normalize name fields
     const fName = firstName ?? firstname ?? "";
     const lName = lastName ?? lastname ?? "";
 
-    // Upsert contact
+    // Whitelist only safe, primitive contact properties
+    const contactProps = {
+      email,
+      firstname: fName,
+      lastname: lName,
+      phone: phone || ""
+    };
+
+    // Upsert by email
     const existing = await findContactByEmail(email);
     let contactId;
     if (existing) {
       contactId = existing.id;
-      const updateRes = await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
-        properties: { email, firstname: fName, lastname: lName, phone: phone || "", ...restProps }
-      });
-      // proceed; we still may create a task
+      await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties: contactProps });
     } else {
-      const createRes = await hs.post("/crm/v3/objects/contacts", {
-        properties: { email, firstname: fName, lastname: lName, phone: phone || "", ...restProps }
-      });
+      const createRes = await hs.post("/crm/v3/objects/contacts", { properties: contactProps });
       contactId = createRes.data.id;
     }
 
-    // Optionally create a Task, unassociated, titled "Name – {date/time}", due at appointment.startISO
+    // Optionally create a Task from appointment.startISO (no associations)
     let taskId = null;
     if (appointment?.startISO) {
       const who = `${(fName || "").trim()} ${(lName || "").trim()}`.trim() || email;
-      const friendly = new Date(appointment.startISO).toLocaleString("en-US", {
+
+      // For hs_timestamp, milliseconds since epoch is the safest format
+      const dueMs = Number.isFinite(Date.parse(appointment.startISO))
+        ? new Date(appointment.startISO).getTime()
+        : Date.now();
+
+      // Title like "John Doe – Nov 2, 2025, 5:00 PM"
+      const friendly = new Date(dueMs).toLocaleString("en-US", {
         dateStyle: "medium",
         timeStyle: "short"
       });
-      const subject = `${who} – ${friendly}`;
-      const dueISO = appointment.startISO;
 
-      const task = await createTask({
-        subject,
-        dueISO,
-        body: appointment.location ? `Refill at: ${appointment.location}` : "Refill task from iOS app",
-        status: "NOT_STARTED",
-        priority: "MEDIUM"
+      const taskRes = await hs.post("/crm/v3/objects/tasks", {
+        properties: {
+          hs_task_subject: `${who} – ${friendly}`,
+          hs_timestamp: dueMs,
+          hs_task_body: appointment.location
+            ? `Refill at: ${appointment.location}`
+            : "Refill task from iOS app",
+          hs_task_status: "NOT_STARTED", // or COMPLETED
+          hs_task_priority: "MEDIUM"     // HIGH | MEDIUM | LOW
+        }
       });
-      taskId = task?.id || null;
+
+      taskId = taskRes.data?.id ?? null;
     }
 
     return res.status(existing ? 200 : 201).json({
+      ok: true,
       action: existing ? "updated" : "created",
-      id: contactId,
+      contactId,
       taskId
     });
   } catch (err) {
+    console.error("contacts route error:", err.response?.data || err.message);
     return res
       .status(err.response?.status || 500)
       .json({ error: err.message, details: err.response?.data });
@@ -162,6 +173,7 @@ app.post("/api/hubspot/notes", async (req, res) => {
     const noteId = await createNoteForContact(contactId, title, body);
     res.status(201).json({ ok: true, contactId, noteId });
   } catch (err) {
+    console.error("notes route error:", err.response?.data || err.message);
     return res
       .status(err.response?.status || 500)
       .json({ error: err.message, details: err.response?.data });
