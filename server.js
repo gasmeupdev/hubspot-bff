@@ -1,147 +1,117 @@
-// server.js
-// Express BFF for HubSpot: Contact upsert + Meeting + Association
-// Paste this file into your repo (e.g., gasmeupdev/hubspot-bff/server.js)
+import express from "express";
+import axios from "axios";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import dotenv from "dotenv";
 
-const express = require('express');
-const axios = require('axios');
+dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// --- (Optional) CORS for web testing; safe to leave on for mobile ---
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*'); // lock down later if needed
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// ---------- HubSpot setup ----------
+const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+
 if (!HUBSPOT_TOKEN) {
-  console.warn('[WARN] HUBSPOT_TOKEN not set. Set it in Render → Environment.');
+  console.error("Missing HUBSPOT_TOKEN env var.");
+  process.exit(1);
 }
+
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
+app.use(
+  cors({
+    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
+    credentials: false
+  })
+);
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 60,
+    standardHeaders: "draft-7",
+    legacyHeaders: false
+  })
+);
 
 const hs = axios.create({
-  baseURL: 'https://api.hubspot.com',
-  headers: {
-    Authorization: `Bearer ${HUBSPOT_TOKEN}`,
-    'Content-Type': 'application/json'
-  },
-  timeout: 10000
+  baseURL: "https://api.hubapi.com",
+  headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
+  timeout: 15000
 });
 
-// ---------- Helpers ----------
-async function upsertContact({ firstName, lastName, email, phone }) {
-  // Try create → on 409, search+update
-  try {
-    const r = await hs.post('/crm/v3/objects/contacts', {
-      properties: {
-        email,
-        firstname: firstName || '',
-        lastname: lastName || '',
-        phone: phone || ''
+async function findContactByEmail(email) {
+  const res = await hs.post("/crm/v3/objects/contacts/search", {
+    filterGroups: [
+      {
+        filters: [{ propertyName: "email", operator: "EQ", value: email }]
       }
-    });
-    return r.data; // { id, properties, ... }
-  } catch (err) {
-    const s = err.response?.status;
-    if (s === 409) {
-      // Already exists → search
-      const search = await hs.post('/crm/v3/objects/contacts/search', {
-        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
-        properties: ['email', 'firstname', 'lastname', 'phone'],
-        limit: 1
-      });
-      const found = search.data?.results?.[0];
-      if (!found) throw new Error('Email conflict but contact not found via search');
-      const id = found.id;
-
-      // Update with provided values if present
-      await hs.patch(`/crm/v3/objects/contacts/${id}`, {
-        properties: {
-          firstname: firstName ?? found.properties.firstname,
-          lastname: lastName ?? found.properties.lastname,
-          phone: phone ?? found.properties.phone
-        }
-      });
-
-      // Return the contact
-      const getRes = await hs.get(`/crm/v3/objects/contacts/${id}`);
-      return getRes.data;
-    }
-    throw err;
-  }
-}
-
-async function createMeeting({ title, body, location, startISO, endISO }) {
-  const r = await hs.post('/crm/v3/objects/meetings', {
-    properties: {
-      hs_meeting_start_time: startISO, // ISO8601
-      hs_meeting_end_time: endISO,
-      hs_meeting_title: title || 'Gas Refill Appointment',
-      hs_meeting_body: body || 'Scheduled via iOS app',
-      hs_meeting_location: location || 'On-site'
-      // hs_timestamp will default to start time in newer portals
-    }
+    ],
+    properties: ["email", "firstname", "lastname"]
   });
-  return r.data; // { id, ... }
+  return res.data?.results?.[0] || null;
 }
 
-async function associateMeetingToContact(meetingId, contactId) {
-  // Try default associationTypeId; if it fails, fetch a valid one
-  try {
-    await hs.put(`/crm/v4/objects/meetings/${meetingId}/associations/contacts/${contactId}`, {
-      associationTypeId: 200
-    });
-  } catch {
-    const labels = await hs.get('/crm/v4/associations/meetings/contacts/labels');
-    const typeId = labels.data?.results?.[0]?.typeId;
-    if (!typeId) throw new Error('No associationTypeId available for meetings↔contacts');
-    await hs.put(`/crm/v4/objects/meetings/${meetingId}/associations/contacts/${contactId}`, {
-      associationTypeId: typeId
-    });
-  }
+async function createNoteForContact(contactId, title, body) {
+  const noteRes = await hs.post("/crm/v3/objects/notes", {
+    properties: { hs_note_body: body, hs_note_title: title }
+  });
+  const noteId = noteRes.data.id;
+  await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}`, [
+    { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 280 }
+  ]);
+  return noteId;
 }
 
-// ---------- Route your iOS app calls ----------
-app.post('/api/hubspot/contacts', async (req, res) => {
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.post("/api/hubspot/contacts", async (req, res) => {
   try {
-    const { firstName, lastName, email, phone, appointment } = req.body || {};
-
-    if (!email) {
-      return res.status(400).json({ ok: false, error: 'Email required' });
-    }
-
-    // 1) Upsert contact
-    const contact = await upsertContact({ firstName, lastName, email, phone });
-
-    // 2) If appointment provided, create meeting and associate
-    let meeting = null;
-    if (appointment?.startISO && appointment?.endISO) {
-      meeting = await createMeeting({
-        startISO: appointment.startISO,
-        endISO: appointment.endISO,
-        location: appointment.location || 'On-site',
-        title: 'Gas Refill Appointment',
-        body: `Scheduled via iOS app for ${email}`
+    const { email, ...props } = req.body || {};
+    if (!email) return res.status(400).json({ error: "Missing email" });
+    const existing = await findContactByEmail(email);
+    if (existing) {
+      const id = existing.id;
+      const updateRes = await hs.patch(`/crm/v3/objects/contacts/${id}`, {
+        properties: { email, ...props }
       });
-      await associateMeetingToContact(meeting.id, contact.id);
+      return res.json({ action: "updated", id, contact: updateRes.data });
+    } else {
+      const createRes = await hs.post("/crm/v3/objects/contacts", {
+        properties: { email, ...props }
+      });
+      return res.status(201).json({ action: "created", id: createRes.data.id, contact: createRes.data });
     }
-
-    res.json({ ok: true, contactId: contact.id, meetingId: meeting?.id ?? null });
   } catch (err) {
-    const payload = err?.response?.data || err.message || String(err);
-    console.error('[ERROR] /api/hubspot/contacts →', payload);
-    const status = err?.response?.status || 500;
-    res.status(status).json({ ok: false, error: 'HubSpot sync failed', details: payload });
+    return res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
   }
 });
 
-// ---------- Start server (Render expects PORT) ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Listening on ${PORT}`);
+app.post("/api/hubspot/notes", async (req, res) => {
+  try {
+    const { email, title, body, contactProperties = {} } = req.body || {};
+    if (!email || !title || !body)
+      return res.status(400).json({ error: "Missing email/title/body" });
+
+    const existing = await findContactByEmail(email);
+    let contactId;
+    if (existing) {
+      contactId = existing.id;
+      if (Object.keys(contactProperties).length)
+        await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties: contactProperties });
+    } else {
+      const createRes = await hs.post("/crm/v3/objects/contacts", {
+        properties: { email, ...contactProperties }
+      });
+      contactId = createRes.data.id;
+    }
+
+    const noteId = await createNoteForContact(contactId, title, body);
+    res.status(201).json({ ok: true, contactId, noteId });
+  } catch (err) {
+    return res.status(err.response?.status || 500).json({ error: err.message, details: err.response?.data });
+  }
 });
+
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
