@@ -1,119 +1,110 @@
-import express from "express";
-import axios from "axios";
-import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import dotenv from "dotenv";
+import Foundation
 
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-
-if (!HUBSPOT_TOKEN) {
-  console.error("Missing HUBSPOT_TOKEN environment variable.");
-  process.exit(1);
+struct HubSpotSubmitResponse: Decodable {
+    let ok: Bool
+    let contactId: String?
+    let taskId: String?
+    let error: String?
+    let details: String?
 }
 
-app.use(helmet());
-app.use(express.json({ limit: "1mb" }));
-app.use(
-  cors({
-    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
-    credentials: false,
-  })
-);
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    limit: 60,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-  })
-);
+enum SubmitError: LocalizedError {
+    case invalidInput(String)
+    case server(String)
+    case badResponse
 
-// ✅ HubSpot API instance
-const hs = axios.create({
-  baseURL: "https://api.hubapi.com",
-  headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
-  timeout: 15000,
-});
-
-// 🔍 Helper: Find contact by email
-async function findContactByEmail(email) {
-  const res = await hs.post("/crm/v3/objects/contacts/search", {
-    filterGroups: [
-      {
-        filters: [{ propertyName: "email", operator: "EQ", value: email }],
-      },
-    ],
-    properties: ["email", "firstname", "lastname"],
-  });
-  return res.data?.results?.[0] || null;
-}
-
-// 🧾 Helper: Create a note for a contact
-async function createNoteForContact(contactId, title, body) {
-  const noteRes = await hs.post("/crm/v3/objects/notes", {
-    properties: { hs_note_body: body, hs_note_title: title },
-  });
-  const noteId = noteRes.data.id;
-
-  // Associate note → contact
-  await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}`, [
-    { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 280 },
-  ]);
-
-  return noteId;
-}
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// 🧠 Main route for contact + task creation
-app.post("/api/hubspot/contacts", async (req, res) => {
-  try {
-    const {
-      email,
-      firstName,
-      lastName,
-      phone,
-      appointment = {},
-      carDetails,
-    } = req.body || {};
-
-    if (!email) return res.status(400).json({ error: "Missing email" });
-
-    const fName = firstName ?? "";
-    const lName = lastName ?? "";
-
-    // ✅ Upsert Contact
-    const existing = await findContactByEmail(email);
-    let contactId;
-    if (existing) {
-      contactId = existing.id;
-      await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
-        properties: { firstname: fName, lastname: lName, phone, email },
-      });
-    } else {
-      const createRes = await hs.post("/crm/v3/objects/contacts", {
-        properties: { firstname: fName, lastname: lName, phone, email },
-      });
-      contactId = createRes.data.id;
+    var errorDescription: String? {
+        switch self {
+        case .invalidInput(let msg): return msg
+        case .server(let msg):       return msg
+        case .badResponse:           return "Unexpected server response."
+        }
     }
+}
 
-    // ✅ Add car info as note on the contact
-    if (carDetails && typeof carDetails === "string") {
-      const noteBody = `Car Details:\n<pre>${carDetails}</pre>`;
-      await createNoteForContact(contactId, "Car Information", noteBody);
+final class NetworkClient {
+    static let shared = NetworkClient()
+    private init() {}
+
+    // your Render URL
+    private let endpoint = URL(string: "https://hubspot-bff.onrender.com/api/hubspot/contacts")!
+
+    func submitCheckout(draft: GMUCheckoutDraft) async throws -> HubSpotSubmitResponse {
+        // 1. validate
+        let email = draft.contact.email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty else {
+            throw SubmitError.invalidInput("Email is required.")
+        }
+        guard let start = draft.appointment.startDate,
+              let end   = draft.appointment.endDate else {
+            throw SubmitError.invalidInput("Appointment date & time are required.")
+        }
+
+        // 2. build location string for the task body
+        var locationString = draft.appointment.location
+        if locationString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var parts: [String] = []
+            if !draft.location.address1.isEmpty { parts.append(draft.location.address1) }
+            if !draft.location.address2.isEmpty { parts.append(draft.location.address2) }
+            var cityLine = ""
+            if !draft.location.city.isEmpty      { cityLine += draft.location.city }
+            if !draft.location.state.isEmpty     { cityLine += cityLine.isEmpty ? draft.location.state : ", \(draft.location.state)" }
+            if !draft.location.postalCode.isEmpty { cityLine += cityLine.isEmpty ? draft.location.postalCode : " \(draft.location.postalCode)" }
+            if !cityLine.isEmpty { parts.append(cityLine) }
+            locationString = parts.joined(separator: ", ")
+        }
+
+        // 3. ISO dates
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = TimeZone(secondsFromGMT: 0)
+
+        // 4. car object (clean)
+        let carDetails: [String: Any] = [
+            "make": draft.car.make,
+            "model": draft.car.model,
+            "year": draft.car.year ?? 0,
+            "color": draft.car.color,
+            "licensePlate": draft.car.licensePlate
+        ]
+
+        // 5. final payload
+        let payload: [String: Any] = [
+            "email":     email,
+            "firstName": draft.contact.firstName,
+            "lastName":  draft.contact.lastName,
+            "phone":     draft.contact.phone,
+            "carDetails": carDetails,
+            "appointment": [
+                "startISO": iso.string(from: start),
+                "endISO":   iso.string(from: end),
+                "location": locationString
+            ]
+        ]
+
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(UUID().uuidString, forHTTPHeaderField: "Idempotency-Key")
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw SubmitError.badResponse
+        }
+
+        print("→ POST \(endpoint.absoluteString) = \(http.statusCode)")
+        if let body = String(data: data, encoding: .utf8) {
+            print("Response:", body)
+        }
+
+        if !(200...299).contains(http.statusCode) {
+            throw SubmitError.server(String(data: data, encoding: .utf8) ?? "HubSpot error")
+        }
+
+        guard let decoded = try? JSONDecoder().decode(HubSpotSubmitResponse.self, from: data) else {
+            throw SubmitError.badResponse
+        }
+
+        return decoded
     }
-
-    // ✅ Create a Task using appointment info
-    let taskId = null;
-    if (appointment?.startISO) {
-      const taskTitle = `${fName || lName || email} - ${appointment.startISO}`;
-      const taskBody =
-        appointment?.location?.trim()?.length > 0
-          ? `Refill Location:\n${appointment.location}`
-          : "R
+}
