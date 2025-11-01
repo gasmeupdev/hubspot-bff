@@ -60,7 +60,7 @@ async function findContactByEmail(email) {
 }
 
 async function createNoteForContact(contactId, title, body) {
-  const now = Date.now(); // ms since epoch – what HubSpot wants for datetime
+  const now = Date.now(); // ms since epoch – what HubSpot wants
   const fullBody =
     title && title.trim().length > 0 ? `${title}\n\n${body}` : body;
 
@@ -72,13 +72,13 @@ async function createNoteForContact(contactId, title, body) {
   });
   const noteId = noteRes.data.id;
 
-  // associate note -> contact
+  // associate note -> contact (this was the original problem: wrong type)
   await hs.put(
     `/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}`,
     [
       {
         associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: 202 // note → contact (fixed)
+        associationTypeId: 202 // ✅ correct: note → contact
       }
     ]
   );
@@ -122,7 +122,7 @@ app.get("/", (req, res) => {
   return res.json({ ok: true, name: "hubspot-bff", ts: Date.now() });
 });
 
-// main create-or-update flow from iOS app
+// MAIN ROUTE (original)
 app.post("/hubspot/app-intake", async (req, res) => {
   try {
     const {
@@ -202,6 +202,95 @@ app.post("/hubspot/app-intake", async (req, res) => {
     });
   } catch (err) {
     console.error("HubSpot error:", err.response?.data || err.message);
+    return res
+      .status(err.response?.status || 500)
+      .json({ error: err.message, details: err.response?.data });
+  }
+});
+
+// ✅ NEW: alias route for your iOS app
+// your app is calling POST /api/hubspot/contacts
+// so we run the exact same logic as /hubspot/app-intake
+app.post("/api/hubspot/contacts", async (req, res) => {
+  // just call the same logic inline to avoid changing the original handler
+  try {
+    const {
+      email,
+      firstName,
+      lastName,
+      phone,
+      carDetails,
+      appointment
+    } = req.body || {};
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    const fName = firstName ?? "";
+    const lName = lastName ?? "";
+
+    // 1) upsert contact
+    const existing = await findContactByEmail(email);
+    let contactId;
+
+    if (existing) {
+      contactId = existing.id;
+      await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
+        properties: {
+          email,
+          firstname: fName,
+          lastname: lName,
+          phone: phone ?? ""
+        }
+      });
+    } else {
+      const createRes = await hs.post("/crm/v3/objects/contacts", {
+        properties: {
+          email,
+          firstname: fName,
+          lastname: lName,
+          phone: phone ?? ""
+        }
+      });
+      contactId = createRes.data.id;
+    }
+
+    // 2) car details -> note on contact
+    if (carDetails && typeof carDetails === "object") {
+      const pretty = JSON.stringify(carDetails, null, 2);
+      const noteBody = `Car details from iOS app:\n${pretty}`;
+      await createNoteForContact(contactId, "Car Information", noteBody);
+    }
+
+    // 3) appointment -> task on contact
+    let taskId = null;
+    if (appointment && appointment.startISO) {
+      const start = new Date(appointment.startISO);
+      const ts = isNaN(start.getTime()) ? Date.now() : start.getTime();
+
+      const who = (fName || lName || email).trim();
+      const human = start.toLocaleString("en-US", {
+        dateStyle: "medium",
+        timeStyle: "short"
+      });
+
+      const subject = `${who} – ${human}`;
+      const body =
+        appointment.location && appointment.location.trim().length > 0
+          ? `Refill location:\n${appointment.location}`
+          : "Refill appointment from app";
+
+      taskId = await createTaskForContact(contactId, subject, body, ts);
+    }
+
+    return res.status(201).json({
+      ok: true,
+      contactId,
+      taskId
+    });
+  } catch (err) {
+    console.error("HubSpot error (alias):", err.response?.data || err.message);
     return res
       .status(err.response?.status || 500)
       .json({ error: err.message, details: err.response?.data });
