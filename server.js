@@ -64,7 +64,6 @@ async function createNoteForContact(contactId, title, body) {
   const now = Date.now(); // ms since epoch – what HubSpot wants for datetime
   const noteRes = await hs.post("/crm/v3/objects/notes", {
     properties: {
-      hs_note_title: title,
       hs_note_body: body,
       hs_timestamp: now
     }
