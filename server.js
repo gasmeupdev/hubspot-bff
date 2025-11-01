@@ -59,14 +59,12 @@ async function findContactByEmail(email) {
   return res.data?.results?.[0] || null;
 }
 
+// âœ… FIX HERE: add hs_timestamp to the note
 async function createNoteForContact(contactId, title, body) {
-  const now = Date.now(); // ms since epoch – what HubSpot wants for datetime
-  const fullBody =
-    title && title.trim().length > 0 ? `${title}\n\n${body}` : body;
-
+  const now = Date.now(); // ms since epoch â€“ what HubSpot wants for datetime
   const noteRes = await hs.post("/crm/v3/objects/notes", {
     properties: {
-      hs_note_body: fullBody,
+      hs_note_body: body,
       hs_timestamp: now
     }
   });
@@ -78,7 +76,7 @@ async function createNoteForContact(contactId, title, body) {
     [
       {
         associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: 202 // note → contact
+        associationTypeId: 280 // note â†’ contact
       }
     ]
   );
@@ -105,7 +103,7 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
     [
       {
         associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: 204 // task → contact
+        associationTypeId: 204 // task â†’ contact
       }
     ]
   );
@@ -117,13 +115,12 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
 // routes
 // ----------------------------------------------------
 
-// simple health
-app.get("/", (req, res) => {
-  return res.json({ ok: true, name: "hubspot-bff", ts: Date.now() });
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
 });
 
-// main create-or-update flow from iOS app
-app.post("/hubspot/app-intake", async (req, res) => {
+// main endpoint your iOS app calls
+app.post("/api/hubspot/contacts", async (req, res) => {
   try {
     const {
       email,
@@ -135,7 +132,7 @@ app.post("/hubspot/app-intake", async (req, res) => {
     } = req.body || {};
 
     if (!email) {
-      return res.status(400).json({ error: "email is required" });
+      return res.status(400).json({ error: "Missing email" });
     }
 
     const fName = firstName ?? "";
@@ -186,7 +183,7 @@ app.post("/hubspot/app-intake", async (req, res) => {
         timeStyle: "short"
       });
 
-      const subject = `${who} – ${human}`;
+      const subject = `${who} â€“ ${human}`;
       const body =
         appointment.location && appointment.location.trim().length > 0
           ? `Refill location:\n${appointment.location}`
