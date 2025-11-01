@@ -59,13 +59,15 @@ async function findContactByEmail(email) {
   return res.data?.results?.[0] || null;
 }
 
-// ✅ FIX HERE: add hs_timestamp to the note
+// ✅ UPDATED: drop invalid hs_note_title, push title into body
 async function createNoteForContact(contactId, title, body) {
   const now = Date.now(); // ms since epoch – what HubSpot wants for datetime
+  const fullBody =
+    title && title.trim().length > 0 ? `${title}\n\n${body}` : body;
+
   const noteRes = await hs.post("/crm/v3/objects/notes", {
     properties: {
-      hs_note_title: title,
-      hs_note_body: body,
+      hs_note_body: fullBody,
       hs_timestamp: now
     }
   });
@@ -116,12 +118,13 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
 // routes
 // ----------------------------------------------------
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+// simple health
+app.get("/", (req, res) => {
+  return res.json({ ok: true, name: "hubspot-bff", ts: Date.now() });
 });
 
-// main endpoint your iOS app calls
-app.post("/api/hubspot/contacts", async (req, res) => {
+// main create-or-update flow from iOS app
+app.post("/hubspot/app-intake", async (req, res) => {
   try {
     const {
       email,
@@ -133,7 +136,7 @@ app.post("/api/hubspot/contacts", async (req, res) => {
     } = req.body || {};
 
     if (!email) {
-      return res.status(400).json({ error: "Missing email" });
+      return res.status(400).json({ error: "email is required" });
     }
 
     const fName = firstName ?? "";
