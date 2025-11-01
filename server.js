@@ -23,7 +23,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
     origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
-    credentials: false,
+    credentials: false
   })
 );
 app.use(
@@ -31,40 +31,43 @@ app.use(
     windowMs: 60 * 1000,
     limit: 60,
     standardHeaders: "draft-7",
-    legacyHeaders: false,
+    legacyHeaders: false
   })
 );
 
+// HubSpot client
 const hs = axios.create({
   baseURL: "https://api.hubapi.com",
-  headers: {
-    Authorization: `Bearer ${HUBSPOT_TOKEN}`,
-    "Content-Type": "application/json",
-  },
-  timeout: 15000,
+  headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
+  timeout: 15000
 });
 
-// find a contact by email
+// ----------------------------------------------------
+// helpers
+// ----------------------------------------------------
+
 async function findContactByEmail(email) {
   const res = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [
       {
-        filters: [{ propertyName: "email", operator: "EQ", value: email }],
-      },
+        filters: [{ propertyName: "email", operator: "EQ", value: email }]
+      }
     ],
     properties: ["email", "firstname", "lastname", "phone"],
-    limit: 1,
+    limit: 1
   });
   return res.data?.results?.[0] || null;
 }
 
-// create a note and link it to a contact
+// ✅ FIX HERE: add hs_timestamp to the note
 async function createNoteForContact(contactId, title, body) {
+  const now = Date.now(); // ms since epoch – what HubSpot wants for datetime
   const noteRes = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_title: title,
       hs_note_body: body,
-    },
+      hs_timestamp: now
+    }
   });
   const noteId = noteRes.data.id;
 
@@ -74,17 +77,50 @@ async function createNoteForContact(contactId, title, body) {
     [
       {
         associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: 280, // note -> contact
-      },
+        associationTypeId: 280 // note → contact
+      }
     ]
   );
 
   return noteId;
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+async function createTaskForContact(contactId, subject, body, timestamp) {
+  const taskRes = await hs.post("/crm/v3/objects/tasks", {
+    properties: {
+      hs_task_subject: subject,
+      hs_task_body: body,
+      hs_timestamp: timestamp,
+      hs_task_status: "NOT_STARTED",
+      hs_task_priority: "MEDIUM"
+    }
+  });
 
-// MAIN endpoint your iOS app is calling
+  const taskId = taskRes.data.id;
+
+  // link task -> contact
+  await hs.put(
+    `/crm/v4/objects/tasks/${taskId}/associations/contacts/${contactId}`,
+    [
+      {
+        associationCategory: "HUBSPOT_DEFINED",
+        associationTypeId: 204 // task → contact
+      }
+    ]
+  );
+
+  return taskId;
+}
+
+// ----------------------------------------------------
+// routes
+// ----------------------------------------------------
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// main endpoint your iOS app calls
 app.post("/api/hubspot/contacts", async (req, res) => {
   try {
     const {
@@ -92,8 +128,8 @@ app.post("/api/hubspot/contacts", async (req, res) => {
       firstName,
       lastName,
       phone,
-      carDetails, // object from iOS
-      appointment, // { startISO, endISO, location }
+      carDetails,
+      appointment
     } = req.body || {};
 
     if (!email) {
@@ -103,7 +139,7 @@ app.post("/api/hubspot/contacts", async (req, res) => {
     const fName = firstName ?? "";
     const lName = lastName ?? "";
 
-    // 1) CREATE / UPDATE CONTACT
+    // 1) upsert contact
     const existing = await findContactByEmail(email);
     let contactId;
 
@@ -114,8 +150,8 @@ app.post("/api/hubspot/contacts", async (req, res) => {
           email,
           firstname: fName,
           lastname: lName,
-          phone: phone ?? "",
-        },
+          phone: phone ?? ""
+        }
       });
     } else {
       const createRes = await hs.post("/crm/v3/objects/contacts", {
@@ -123,67 +159,44 @@ app.post("/api/hubspot/contacts", async (req, res) => {
           email,
           firstname: fName,
           lastname: lName,
-          phone: phone ?? "",
-        },
+          phone: phone ?? ""
+        }
       });
       contactId = createRes.data.id;
     }
 
-    // 2) CAR DETAILS → NOTE on contact (pretty JSON)
+    // 2) car details -> note on contact
     if (carDetails && typeof carDetails === "object") {
       const pretty = JSON.stringify(carDetails, null, 2);
-      const body = `Car details from iOS app:\n${pretty}`;
-      await createNoteForContact(contactId, "Car Information", body);
+      const noteBody = `Car details from iOS app:\n${pretty}`;
+      await createNoteForContact(contactId, "Car Information", noteBody);
     }
 
-    // 3) APPOINTMENT → TASK linked to contact
+    // 3) appointment -> task on contact
     let taskId = null;
     if (appointment && appointment.startISO) {
-      // Task subject: Name + date/time
+      const start = new Date(appointment.startISO);
+      const ts = isNaN(start.getTime()) ? Date.now() : start.getTime();
+
       const who = (fName || lName || email).trim();
-      const startDate = new Date(appointment.startISO);
-      const friendly = startDate.toLocaleString("en-US", {
+      const human = start.toLocaleString("en-US", {
         dateStyle: "medium",
-        timeStyle: "short",
+        timeStyle: "short"
       });
 
-      const subject = `${who} – ${friendly}`;
-      const locationText =
-        (appointment.location && appointment.location.trim()) ||
-        "Refill appointment from iOS app";
+      const subject = `${who} – ${human}`;
+      const body =
+        appointment.location && appointment.location.trim().length > 0
+          ? `Refill location:\n${appointment.location}`
+          : "Refill appointment from app";
 
-      const dueTs = isNaN(startDate.getTime())
-        ? Date.now()
-        : startDate.getTime();
-
-      const taskRes = await hs.post("/crm/v3/objects/tasks", {
-        properties: {
-          hs_task_subject: subject,
-          hs_task_body: locationText, // 🟦 location goes here
-          hs_timestamp: dueTs,
-          hs_task_status: "NOT_STARTED",
-          hs_task_priority: "MEDIUM",
-        },
-      });
-
-      taskId = taskRes.data.id;
-
-      // ✅ ASSOCIATE TASK → CONTACT (type 204 for task→contact) :contentReference[oaicite:1]{index=1}
-      await hs.put(
-        `/crm/v4/objects/tasks/${taskId}/associations/contacts/${contactId}`,
-        [
-          {
-            associationCategory: "HUBSPOT_DEFINED",
-            associationTypeId: 204, // task to contact
-          },
-        ]
-      );
+      taskId = await createTaskForContact(contactId, subject, body, ts);
     }
 
     return res.status(201).json({
       ok: true,
       contactId,
-      taskId,
+      taskId
     });
   } catch (err) {
     console.error("HubSpot error:", err.response?.data || err.message);
@@ -193,6 +206,9 @@ app.post("/api/hubspot/contacts", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------
+// start
+// ----------------------------------------------------
 app.listen(PORT, () => {
   console.log(`Listening on ${PORT}`);
 });
