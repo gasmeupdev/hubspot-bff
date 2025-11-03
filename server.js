@@ -14,7 +14,9 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 if (!HUBSPOT_TOKEN) {
-  console.error("Missing HUBSPOT_TOKEN env var.");
+  console.error(
+    "HUBSPOT_TOKEN is missing. Set it in your environment / .env file."
+  );
   process.exit(1);
 }
 
@@ -70,9 +72,12 @@ async function createNoteForContact(contactId, title, body) {
       hs_timestamp: now
     }
   });
-  const noteId = noteRes.data.id;
 
-  // associate note -> contact (this was the original problem: wrong type)
+  const noteId = noteRes.data?.id;
+  if (!noteId) {
+    throw new Error("Failed to create note");
+  }
+
   await hs.put(
     `/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}`,
     [
@@ -97,15 +102,17 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
     }
   });
 
-  const taskId = taskRes.data.id;
+  const taskId = taskRes.data?.id;
+  if (!taskId) {
+    throw new Error("Failed to create task");
+  }
 
-  // link task -> contact
   await hs.put(
     `/crm/v4/objects/tasks/${taskId}/associations/contacts/${contactId}`,
     [
       {
         associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: 204 // task → contact
+        associationTypeId: 3 // contact ↔ task
       }
     ]
   );
@@ -113,11 +120,88 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
   return taskId;
 }
 
+// ✅ vehicle helpers (pull vehicles from notes)
+
+// get associated note ids for a contact
+async function getNoteIdsForContact(contactId) {
+  const res = await hs.get(
+    `/crm/v4/objects/contacts/${contactId}/associations/notes`
+  );
+  return res.data?.results?.map((r) => r.to?.id).filter(Boolean) || [];
+}
+
+// get a single note (just need body)
+async function getNoteById(noteId) {
+  const res = await hs.get(
+    `/crm/v3/objects/notes/${noteId}?properties=hs_note_body`
+  );
+  return res.data;
+}
+
+// extract JSON from note body like:
+// "Car Information Car details from iOS app: { ... }"
+// or "Car Information\n\nCar details from iOS app:\n{ ... }"
+function extractVehicleJsonFromNoteBody(body) {
+  if (!body || typeof body !== "string") return null;
+
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  const jsonStr = body.slice(start, end + 1).trim();
+
+  try {
+    return JSON.parse(jsonStr);
+  } catch (err) {
+    return null;
+  }
+}
+
+// normalize to frontend shape
+function normalizeVehicle(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const plate =
+    raw.licensePlate ||
+    raw.plate ||
+    raw.license ||
+    raw.license_plate ||
+    "";
+
+  const vehicle = {
+    id:
+      plate ||
+      `${raw.make || "vehicle"}-${raw.model || ""}-${
+        Math.random().toString(36).slice(2, 7)
+      }`,
+    make: raw.make || "",
+    model: raw.model || "",
+    year: raw.year ? String(raw.year) : "",
+    color: raw.color || "",
+    plate
+  };
+
+  // if we truly got nothing, skip
+  if (
+    !vehicle.make &&
+    !vehicle.model &&
+    !vehicle.year &&
+    !vehicle.color &&
+    !vehicle.plate
+  ) {
+    return null;
+  }
+
+  return vehicle;
+}
+
 // ----------------------------------------------------
 // routes
 // ----------------------------------------------------
 
-// simple health
 app.get("/", (req, res) => {
   return res.json({ ok: true, name: "hubspot-bff", ts: Date.now() });
 });
@@ -138,36 +222,34 @@ app.post("/hubspot/app-intake", async (req, res) => {
       return res.status(400).json({ error: "email is required" });
     }
 
-    const fName = firstName ?? "";
-    const lName = lastName ?? "";
+    // 1) upsert / find contact
+    let contact = await findContactByEmail(email);
 
-    // 1) upsert contact
-    const existing = await findContactByEmail(email);
-    let contactId;
-
-    if (existing) {
-      contactId = existing.id;
-      await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
-        properties: {
-          email,
-          firstname: fName,
-          lastname: lName,
-          phone: phone ?? ""
-        }
-      });
-    } else {
+    // if not found -> create
+    if (!contact) {
       const createRes = await hs.post("/crm/v3/objects/contacts", {
         properties: {
           email,
-          firstname: fName,
-          lastname: lName,
+          firstname: firstName ?? "",
+          lastname: lastName ?? "",
           phone: phone ?? ""
         }
       });
-      contactId = createRes.data.id;
+      contact = createRes.data;
+    } else {
+      // update minimal fields if present
+      await hs.patch(`/crm/v3/objects/contacts/${contact.id}`, {
+        properties: {
+          firstname: firstName ?? contact.properties?.firstname ?? "",
+          lastname: lastName ?? contact.properties?.lastname ?? "",
+          phone: phone ?? contact.properties?.phone ?? ""
+        }
+      });
     }
 
-    // 2) car details -> note on contact
+    const contactId = contact.id;
+
+    // 2) carDetails -> note on contact
     if (carDetails && typeof carDetails === "object") {
       const pretty = JSON.stringify(carDetails, null, 2);
       const noteBody = `Car details from iOS app:\n${pretty}`;
@@ -180,7 +262,7 @@ app.post("/hubspot/app-intake", async (req, res) => {
       const start = new Date(appointment.startISO);
       const ts = isNaN(start.getTime()) ? Date.now() : start.getTime();
 
-      const who = (fName || lName || email).trim();
+      const who = (firstName || lastName || email).trim();
       const human = start.toLocaleString("en-US", {
         dateStyle: "medium",
         timeStyle: "short"
@@ -212,7 +294,6 @@ app.post("/hubspot/app-intake", async (req, res) => {
 // your app is calling POST /api/hubspot/contacts
 // so we run the exact same logic as /hubspot/app-intake
 app.post("/api/hubspot/contacts", async (req, res) => {
-  // just call the same logic inline to avoid changing the original handler
   try {
     const {
       email,
@@ -227,49 +308,42 @@ app.post("/api/hubspot/contacts", async (req, res) => {
       return res.status(400).json({ error: "email is required" });
     }
 
-    const fName = firstName ?? "";
-    const lName = lastName ?? "";
+    let contact = await findContactByEmail(email);
 
-    // 1) upsert contact
-    const existing = await findContactByEmail(email);
-    let contactId;
-
-    if (existing) {
-      contactId = existing.id;
-      await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
-        properties: {
-          email,
-          firstname: fName,
-          lastname: lName,
-          phone: phone ?? ""
-        }
-      });
-    } else {
+    if (!contact) {
       const createRes = await hs.post("/crm/v3/objects/contacts", {
         properties: {
           email,
-          firstname: fName,
-          lastname: lName,
+          firstname: firstName ?? "",
+          lastname: lastName ?? "",
           phone: phone ?? ""
         }
       });
-      contactId = createRes.data.id;
+      contact = createRes.data;
+    } else {
+      await hs.patch(`/crm/v3/objects/contacts/${contact.id}`, {
+        properties: {
+          firstname: firstName ?? contact.properties?.firstname ?? "",
+          lastname: lastName ?? contact.properties?.lastname ?? "",
+          phone: phone ?? contact.properties?.phone ?? ""
+        }
+      });
     }
 
-    // 2) car details -> note on contact
+    const contactId = contact.id;
+
     if (carDetails && typeof carDetails === "object") {
       const pretty = JSON.stringify(carDetails, null, 2);
       const noteBody = `Car details from iOS app:\n${pretty}`;
       await createNoteForContact(contactId, "Car Information", noteBody);
     }
 
-    // 3) appointment -> task on contact
     let taskId = null;
     if (appointment && appointment.startISO) {
       const start = new Date(appointment.startISO);
       const ts = isNaN(start.getTime()) ? Date.now() : start.getTime();
 
-      const who = (fName || lName || email).trim();
+      const who = (firstName || lastName || email).trim();
       const human = start.toLocaleString("en-US", {
         dateStyle: "medium",
         timeStyle: "short"
@@ -291,6 +365,52 @@ app.post("/api/hubspot/contacts", async (req, res) => {
     });
   } catch (err) {
     console.error("HubSpot error (alias):", err.response?.data || err.message);
+    return res
+      .status(err.response?.status || 500)
+      .json({ error: err.message, details: err.response?.data });
+  }
+});
+
+// ----------------------------------------------------
+// vehicles -> from hubspot notes
+// GET /vehicles?email=someone@example.com
+// ----------------------------------------------------
+app.get("/vehicles", async (req, res) => {
+  const email = req.query.email;
+  if (!email) {
+    return res.status(400).json({ error: "email query param is required" });
+  }
+
+  try {
+    const contact = await findContactByEmail(email);
+    if (!contact) {
+      return res.json({ vehicles: [] });
+    }
+
+    const contactId = contact.id;
+    const noteIds = await getNoteIdsForContact(contactId);
+
+    const notes = await Promise.all(
+      noteIds.map((id) => getNoteById(id).catch(() => null))
+    );
+
+    const vehicles = [];
+
+    for (const note of notes) {
+      if (!note?.properties?.hs_note_body) continue;
+      const raw = extractVehicleJsonFromNoteBody(note.properties.hs_note_body);
+      const vehicle = normalizeVehicle(raw);
+      if (vehicle) {
+        vehicles.push(vehicle);
+      }
+    }
+
+    return res.json({ vehicles });
+  } catch (err) {
+    console.error(
+      "HubSpot error (vehicles):",
+      err.response?.data || err.message
+    );
     return res
       .status(err.response?.status || 500)
       .json({ error: err.message, details: err.response?.data });
