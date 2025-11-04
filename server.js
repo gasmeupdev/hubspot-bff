@@ -116,16 +116,38 @@ async function createTaskForContact(contactId, subject, body, timestamp) {
 // Helpers: Vehicles from Notes
 // ----------------------------------------------------
 
-// fetch associated note IDs for a contact
+// v4: fetch associated note IDs for a contact
 async function getNoteIdsForContact(contactId) {
   const res = await hs.get(`/crm/v4/objects/contacts/${contactId}/associations/notes`);
   return res.data?.results?.map((r) => r.to?.id).filter(Boolean) || [];
 }
 
-// fetch a single note (body only)
+// v3: fetch a single note (body only)
 async function getNoteById(noteId) {
   const res = await hs.get(`/crm/v3/objects/notes/${noteId}?properties=hs_note_body`);
   return res.data;
+}
+
+// v3: SEARCH notes by association to contact (fallback path)
+async function searchNotesForContact(contactId, limit = 100) {
+  const body = {
+    filterGroups: [
+      {
+        filters: [
+          {
+            propertyName: "associations.contact",
+            operator: "EQ",
+            value: String(contactId)
+          }
+        ]
+      }
+    ],
+    properties: ["hs_note_body"],
+    limit
+  };
+
+  const res = await hs.post("/crm/v3/objects/notes/search", body);
+  return res.data?.results || [];
 }
 
 // normalize HTML-ish bodies coming from HubSpot rich text
@@ -201,7 +223,7 @@ function normalizeVehicle(raw) {
   // if nothing meaningful, skip
   if (!vehicle.make && !vehicle.model && !vehicle.year && !vehicle.color && !vehicle.plate) {
     return null;
-    }
+  }
   return vehicle;
 }
 
@@ -344,6 +366,28 @@ app.post("/api/hubspot/contacts", async (req, res) => {
 // GET /contacts?email=... [&debug=1]  (alias)
 // ----------------------------------------------------
 
+async function fetchVehicleNotesForContact(contactId, debug = false) {
+  // Step A: try associations (fast path)
+  let associationIds = [];
+  try {
+    associationIds = await getNoteIdsForContact(contactId);
+  } catch (e) {
+    if (debug) console.warn("assoc fetch error:", e.response?.data || e.message);
+  }
+
+  // Step B: if empty, try search (reliable path)
+  let notesViaSearch = [];
+  if (associationIds.length === 0) {
+    try {
+      notesViaSearch = await searchNotesForContact(contactId, 100);
+    } catch (e) {
+      if (debug) console.warn("search fetch error:", e.response?.data || e.message);
+    }
+  }
+
+  return { associationIds, notesViaSearch };
+}
+
 async function vehiclesHandler(req, res) {
   const email = req.query.email;
   const debug = String(req.query.debug || "") === "1";
@@ -367,34 +411,60 @@ async function vehiclesHandler(req, res) {
     }
 
     const contactId = contact.id;
-    const noteIds = await getNoteIdsForContact(contactId);
+
+    // Fetch notes (associations first, then search fallback)
+    const { associationIds, notesViaSearch } = await fetchVehicleNotesForContact(contactId, debug);
     dbg.steps.push({
       step: "getNoteIdsForContact",
-      count: noteIds.length,
-      noteIds: debug ? noteIds : undefined
+      count: associationIds.length,
+      noteIds: debug ? associationIds : undefined
     });
-
-    const notes = await Promise.all(noteIds.map((id) => getNoteById(id).catch(() => null)));
 
     const vehicles = [];
     const parsedPreview = [];
 
-    for (const note of notes) {
-      const body = note?.properties?.hs_note_body || "";
-      if (!body) continue;
-
-      const raw = extractVehicleJsonFromNoteBody(body);
-      const vehicle = normalizeVehicle(raw);
-      if (debug) {
-        parsedPreview.push({
-          noteId: note?.id,
-          hasBody: !!body,
-          bodyPreview: stripHtml(body).slice(0, 200),
-          extracted: raw,
-          normalized: vehicle
-        });
+    if (associationIds.length > 0) {
+      // fetch note bodies by ids
+      const notes = await Promise.all(associationIds.map((id) => getNoteById(id).catch(() => null)));
+      for (const note of notes) {
+        const body = note?.properties?.hs_note_body || "";
+        if (!body) continue;
+        const raw = extractVehicleJsonFromNoteBody(body);
+        const vehicle = normalizeVehicle(raw);
+        if (debug) {
+          parsedPreview.push({
+            via: "associations",
+            noteId: note?.id,
+            bodyPreview: stripHtml(body).slice(0, 200),
+            extracted: raw,
+            normalized: vehicle
+          });
+        }
+        if (vehicle) vehicles.push(vehicle);
       }
-      if (vehicle) vehicles.push(vehicle);
+    } else {
+      // use search results (already include properties)
+      for (const note of notesViaSearch) {
+        const body = note?.properties?.hs_note_body || "";
+        if (!body) continue;
+        const raw = extractVehicleJsonFromNoteBody(body);
+        const vehicle = normalizeVehicle(raw);
+        if (debug) {
+          parsedPreview.push({
+            via: "search",
+            noteId: note?.id,
+            bodyPreview: stripHtml(body).slice(0, 200),
+            extracted: raw,
+            normalized: vehicle
+          });
+        }
+        if (vehicle) vehicles.push(vehicle);
+      }
+      dbg.steps.push({
+        step: "searchNotesForContact",
+        count: notesViaSearch.length,
+        sampleIds: debug ? notesViaSearch.slice(0, 10).map((n) => n.id) : undefined
+      });
     }
 
     dbg.steps.push({ step: "parseNotes", parsedPreview });
