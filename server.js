@@ -36,7 +36,7 @@ const hs = axios.create({
 async function getContactByEmail(email) {
   const resp = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
-    properties: ["email", "firstname", "lastname"],
+    properties: ["email","firstname","lastname"],
     limit: 1,
   });
   return resp.data?.results?.[0] || null;
@@ -50,105 +50,92 @@ async function getAssociatedNoteIds(contactId) {
 async function getNotesByIds(ids) {
   if (!ids?.length) return [];
   const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
-    properties: ["hs_note_body", "hs_timestamp"],
+    properties: ["hs_note_body","hs_timestamp"],
     inputs: ids.map((id) => ({ id })),
   });
   return resp.data?.results || [];
 }
 
-async function deleteNotes(ids) {
-  if (!ids?.length) return;
-  const batch = 80;
-  for (let i = 0; i < ids.length; i += batch) {
-    const chunk = ids.slice(i, i + batch);
-    await hs.post("/crm/v3/objects/notes/batch/archive", { inputs: chunk.map((id) => ({ id })) });
+// Try to extract JSON object from free-text, and accept without "type"
+function extractVehicleFromBody(body) {
+  if (!body || typeof body !== "string") return null;
+
+  // Direct JSON case
+  try {
+    const obj = JSON.parse(body);
+    const v = normalize(obj);
+    if (v) return v;
+  } catch {}
+
+  // Embedded JSON {...} within text
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const candidate = body.slice(start, end + 1);
+    try {
+      const obj = JSON.parse(candidate);
+      const v = normalize(obj);
+      if (v) return v;
+    } catch {}
   }
+  return null;
 }
 
-async function createNote(body) {
-  const resp = await hs.post("/crm/v3/objects/notes", { properties: { hs_note_body: body } });
-  return resp.data?.id;
+// Accept if it has at least two of the known keys
+function normalize(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const keys = ["make","model","year","color","licensePlate","plate","lic","vehicle","car"];
+  const score = keys.reduce((acc,k) => acc + (obj[k] ? 1 : 0), 0);
+  if (score >= 2) {
+    return {
+      make: obj.make || "",
+      model: obj.model || "",
+      year: String(obj.year || ""),
+      color: obj.color || "",
+      licensePlate: obj.licensePlate || obj.plate || obj.lic || ""
+    };
+  }
+  return null;
 }
 
-async function associateNoteToContact(noteId, contactId) {
-  await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
-}
-
-// handlers
-async function handleGetVehicles(req, res) {
+app.get("/api/hubspot/vehicles", async (req, res) => {
   try {
     const email = String(req.query.email || "").trim();
+    const debug = String(req.query.debug || "") === "1";
     if (!email) return res.status(400).send(JSON.stringify({ error: "email is required" }));
 
     const contact = await getContactByEmail(email);
-    if (!contact) return res.status(200).send(JSON.stringify({ vehicles: [] }));
+    if (!contact) return res.status(200).send(JSON.stringify({ vehicles: [], debug: { reason: "no_contact" } }));
 
     const noteIds = await getAssociatedNoteIds(contact.id);
     const notes = await getNotesByIds(noteIds);
 
     const vehicles = [];
+    const raw = [];
+
     for (const n of notes) {
       const body = n.properties?.hs_note_body || "";
-      try {
-        const obj = JSON.parse(body);
-        if (obj?.type?.toLowerCase() === "vehicle") {
-          vehicles.push({
-            make: obj.make || "",
-            model: obj.model || "",
-            year: obj.year || "",
-            color: obj.color || "",
-            licensePlate: obj.licensePlate || "",
-          });
-        }
-      } catch { /* ignore */ }
+      const v = extractVehicleFromBody(body);
+      if (v) vehicles.push(v);
+      if (debug) raw.push({ id: n.id, body });
     }
-    return res.status(200).send(JSON.stringify({ vehicles }));
+
+    const payload = { vehicles };
+    if (debug) {
+      payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
+    }
+    return res.status(200).send(JSON.stringify(payload));
   } catch (err) {
-    console.error("GET vehicles error:", err.response?.data || err.message);
+    console.error("GET /api/hubspot/vehicles error:", err.response?.data || err.message);
     return res.status(err.response?.status || 500).send(JSON.stringify({ error: "server_error" }));
   }
-}
+});
 
-async function handleSyncVehicles(req, res) {
-  try {
-    const { email, vehicles } = req.body || {};
-    if (!email || !Array.isArray(vehicles)) {
-      return res.status(400).send(JSON.stringify({ error: "email and vehicles[] are required" }));
-    }
-    const contact = await getContactByEmail(email);
-    if (!contact) return res.status(404).send(JSON.stringify({ error: "contact_not_found" }));
-
-    const noteIds = await getAssociatedNoteIds(contact.id);
-    await deleteNotes(noteIds);
-
-    for (const v of vehicles) {
-      const payload = JSON.stringify({
-        type: "vehicle",
-        make: v.make || "",
-        model: v.model || "",
-        year: v.year || "",
-        color: v.color || "",
-        licensePlate: v.licensePlate || "",
-      });
-      const noteId = await createNote(payload);
-      await associateNoteToContact(noteId, contact.id);
-    }
-    return res.status(200).send(JSON.stringify({ ok: true, created: vehicles.length }));
-  } catch (err) {
-    console.error("POST vehicles/sync error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).send(JSON.stringify({ error: "server_error" }));
-  }
-}
-
-app.get("/healthz", (_req, res) => res.status(200).send(JSON.stringify({ ok: true })));
-
-// New canonical routes
-app.get("/api/hubspot/vehicles", handleGetVehicles);
-app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
-
-// Back-compat aliases (your client is calling these)
-app.get("/vehicles", handleGetVehicles);
-app.post("/vehicles/sync", handleSyncVehicles);
+// Back-compat alias
+app.get("/vehicles", (req, res) => {
+  req.url = "/api/hubspot/vehicles" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+  app._router.handle(req, res);
+});
 
 // JSON 404
 app.use((req, res) => res.status(404).send(JSON.stringify({ error: "not_found", path: req.originalUrl })));
