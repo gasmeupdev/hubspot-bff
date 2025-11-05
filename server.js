@@ -47,6 +47,15 @@ async function getAssociatedNoteIds(contactId) {
   return (resp.data?.results || []).map((r) => r.toObjectId);
 }
 
+async function getNotesByIds(ids) {
+  if (!ids?.length) return [];
+  const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
+    properties: ["hs_note_body","hs_timestamp"],
+    inputs: ids.map((id) => ({ id })),
+  });
+  return resp.data?.results || [];
+}
+
 async function deleteNotes(ids) {
   if (!ids?.length) return;
   const batch = 80;
@@ -57,11 +66,11 @@ async function deleteNotes(ids) {
 }
 
 async function createNote(body) {
-  // HubSpot requires hs_timestamp on notes
+  // HubSpot requires hs_timestamp
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: body,
-      hs_timestamp: Date.now() // milliseconds since epoch
+      hs_timestamp: Date.now()
     }
   });
   return resp.data?.id;
@@ -71,14 +80,81 @@ async function associateNoteToContact(noteId, contactId) {
   await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
 }
 
-// ---- routes ----
-app.post(["/api/hubspot/vehicles/sync","/vehicles/sync"], async (req, res) => {
+// ---- parsing helpers (relaxed) ----
+function extractVehicleFromBody(body) {
+  if (!body || typeof body !== "string") return null;
+  try {
+    const obj = JSON.parse(body);
+    const v = normalize(obj);
+    if (v) return v;
+  } catch {}
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const candidate = body.slice(start, end + 1);
+    try {
+      const obj = JSON.parse(candidate);
+      const v = normalize(obj);
+      if (v) return v;
+    } catch {}
+  }
+  return null;
+}
+
+function normalize(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const keys = ["make","model","year","color","licensePlate","plate","lic","vehicle","car"];
+  const score = keys.reduce((acc,k) => acc + (obj[k] ? 1 : 0), 0);
+  if (score >= 2) {
+    return {
+      make: obj.make || "",
+      model: obj.model || "",
+      year: String(obj.year || ""),
+      color: obj.color || "",
+      licensePlate: obj.licensePlate || obj.plate || obj.lic || ""
+    };
+  }
+  return null;
+}
+
+// ---- handlers ----
+async function handleGetVehicles(req, res) {
+  try {
+    const email = String(req.query.email || "").trim();
+    const debug = String(req.query.debug || "") === "1";
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const contact = await getContactByEmail(email);
+    if (!contact) return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
+
+    const noteIds = await getAssociatedNoteIds(contact.id);
+    const notes = await getNotesByIds(noteIds);
+
+    const vehicles = [];
+    const raw = [];
+
+    for (const n of notes) {
+      const body = n.properties?.hs_note_body || "";
+      const v = extractVehicleFromBody(body);
+      if (v) vehicles.push(v);
+      if (debug) raw.push({ id: n.id, body });
+    }
+
+    const payload = { vehicles };
+    if (debug) payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error("GET vehicles error:", err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({ error: "server_error" });
+  }
+}
+
+async function handleSyncVehicles(req, res) {
   try {
     const { email, vehicles } = req.body || {};
     if (!email || !Array.isArray(vehicles)) {
       return res.status(400).json({ error: "email and vehicles[] are required" });
     }
-
     const contact = await getContactByEmail(email);
     if (!contact) return res.status(404).json({ error: "contact_not_found" });
 
@@ -99,10 +175,17 @@ app.post(["/api/hubspot/vehicles/sync","/vehicles/sync"], async (req, res) => {
 
     return res.status(200).json({ ok: true, created: vehicles.length });
   } catch (err) {
-    const status = err.response?.status || 500;
-    return res.status(500).json({ error: "server_error", status, hubspot: err.response?.data || null, message: err.message });
+    console.error("POST vehicles/sync error:", err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({ error: "server_error" });
   }
-});
+}
+
+// ---- routes (canonical + aliases) ----
+app.get("/api/hubspot/vehicles", handleGetVehicles);
+app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
+
+app.get("/vehicles", handleGetVehicles);
+app.post("/vehicles/sync", handleSyncVehicles);
 
 // JSON 404
 app.use((req, res) => res.status(404).json({ error: "not_found", path: req.originalUrl }));
