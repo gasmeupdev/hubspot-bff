@@ -10,9 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const FORCE_DRY_RUN = String(process.env.DRY_RUN || "") === "1";
 
-if (!HUBSPOT_TOKEN) {
-  console.error("Missing HUBSPOT_TOKEN");
+if (!HUBSPOT_TOKEN && !FORCE_DRY_RUN) {
+  console.error("Missing HUBSPOT_TOKEN (set DRY_RUN=1 to bypass HubSpot for testing).");
   process.exit(1);
 }
 
@@ -24,16 +25,37 @@ app.use((req, res, next) => {
   next();
 });
 
+// Request logger
+app.use((req, _res, next) => {
+  console.log(`[REQ] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 const hs = axios.create({
   baseURL: "https://api.hubapi.com",
-  headers: {
+  headers: HUBSPOT_TOKEN ? {
     Authorization: `Bearer ${HUBSPOT_TOKEN}`,
     "Content-Type": "application/json",
-  },
+  } : {},
   timeout: 20000,
 });
 
+hs.interceptors.response.use(
+  (resp) => {
+    console.log(`[HS OK] ${resp.status} ${resp.config.method?.toUpperCase()} ${resp.config.url}`);
+    return resp;
+  },
+  (err) => {
+    const status = err.response?.status || 0;
+    const url = err.config?.url;
+    console.error(`[HS ERR] ${status} ${err.config?.method?.toUpperCase()} ${url}`);
+    if (err.response?.data) console.error(JSON.stringify(err.response.data));
+    return Promise.reject(err);
+  }
+);
+
 async function getContactByEmail(email) {
+  if (FORCE_DRY_RUN) return { id: "12345", properties: { email } };
   const resp = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
     properties: ["email","firstname","lastname"],
@@ -43,21 +65,13 @@ async function getContactByEmail(email) {
 }
 
 async function getAssociatedNoteIds(contactId) {
+  if (FORCE_DRY_RUN) return ["n1","n2"];
   const resp = await hs.get(`/crm/v4/objects/contacts/${contactId}/associations/notes`, { params: { limit: 200 } });
   return (resp.data?.results || []).map((r) => r.toObjectId);
 }
 
-async function getNotesByIds(ids) {
-  if (!ids?.length) return [];
-  const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
-    properties: ["hs_note_body","hs_timestamp"],
-    inputs: ids.map((id) => ({ id })),
-  });
-  return resp.data?.results || [];
-}
-
 async function deleteNotes(ids) {
-  if (!ids?.length) return;
+  if (!ids?.length || FORCE_DRY_RUN) return;
   const batch = 80;
   for (let i = 0; i < ids.length; i += batch) {
     const chunk = ids.slice(i, i + batch);
@@ -66,98 +80,45 @@ async function deleteNotes(ids) {
 }
 
 async function createNote(body) {
+  if (FORCE_DRY_RUN) return `dry-${Math.random().toString(36).slice(2)}`;
   const resp = await hs.post("/crm/v3/objects/notes", { properties: { hs_note_body: body } });
   return resp.data?.id;
 }
 
 async function associateNoteToContact(noteId, contactId) {
+  if (FORCE_DRY_RUN) return;
   await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
 }
 
-// Parsing helpers (relaxed)
-function extractVehicleFromBody(body) {
-  if (!body || typeof body !== "string") return null;
-  try {
-    const obj = JSON.parse(body);
-    const v = normalize(obj);
-    if (v) return v;
-  } catch {}
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    const candidate = body.slice(start, end + 1);
-    try {
-      const obj = JSON.parse(candidate);
-      const v = normalize(obj);
-      if (v) return v;
-    } catch {}
-  }
-  return null;
-}
+// Health
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
 
-function normalize(obj) {
-  if (!obj || typeof obj !== "object") return null;
-  const keys = ["make","model","year","color","licensePlate","plate","lic","vehicle","car"];
-  const score = keys.reduce((acc,k) => acc + (obj[k] ? 1 : 0), 0);
-  if (score >= 2) {
-    return {
-      make: obj.make || "",
-      model: obj.model || "",
-      year: String(obj.year || ""),
-      color: obj.color || "",
-      licensePlate: obj.licensePlate || obj.plate || obj.lic || ""
-    };
-  }
-  return null;
-}
+// Echo to validate iOS body
+app.post("/echo", (req, res) => res.status(200).json({ ok: true, youSent: req.body }));
 
-// ----- Routes -----
-
-// GET vehicles (canonical)
-app.get("/api/hubspot/vehicles", async (req, res) => {
-  try {
-    const email = String(req.query.email || "").trim();
-    const debug = String(req.query.debug || "") === "1";
-    if (!email) return res.status(400).json({ error: "email is required" });
-
-    const contact = await getContactByEmail(email);
-    if (!contact) return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
-
-    const noteIds = await getAssociatedNoteIds(contact.id);
-    const notes = await getNotesByIds(noteIds);
-
-    const vehicles = [];
-    const raw = [];
-
-    for (const n of notes) {
-      const body = n.properties?.hs_note_body || "";
-      const v = extractVehicleFromBody(body);
-      if (v) vehicles.push(v);
-      if (debug) raw.push({ id: n.id, body });
-    }
-
-    const payload = { vehicles };
-    if (debug) payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
-    return res.status(200).json(payload);
-  } catch (err) {
-    console.error("GET /api/hubspot/vehicles error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
-  }
-});
-
-// POST sync vehicles (canonical)
-app.post("/api/hubspot/vehicles/sync", async (req, res) => {
+// Sync with detailed debug
+app.post(["/api/hubspot/vehicles/sync", "/vehicles/sync"], async (req, res) => {
+  const debug = String(req.query.debug || "") === "1";
+  const trace = [];
   try {
     const { email, vehicles } = req.body || {};
+    trace.push({ step: "input", email, vehiclesCount: Array.isArray(vehicles) ? vehicles.length : null });
+
     if (!email || !Array.isArray(vehicles)) {
-      return res.status(400).json({ error: "email and vehicles[] are required" });
+      return res.status(400).json({ error: "email and vehicles[] are required", trace });
     }
+
     const contact = await getContactByEmail(email);
-    if (!contact) return res.status(404).json({ error: "contact_not_found" });
+    trace.push({ step: "getContactByEmail", found: !!contact, contactId: contact?.id });
+    if (!contact) return res.status(404).json({ error: "contact_not_found", trace });
 
     const noteIds = await getAssociatedNoteIds(contact.id);
-    await deleteNotes(noteIds);
+    trace.push({ step: "getAssociatedNoteIds", count: noteIds.length });
 
+    await deleteNotes(noteIds);
+    trace.push({ step: "deleteNotes", deleted: noteIds.length });
+
+    let created = 0;
     for (const v of vehicles) {
       const payload = JSON.stringify({
         make: v.make || "",
@@ -167,24 +128,20 @@ app.post("/api/hubspot/vehicles/sync", async (req, res) => {
         licensePlate: v.licensePlate || ""
       });
       const noteId = await createNote(payload);
+      trace.push({ step: "createNote", noteId });
+
       await associateNoteToContact(noteId, contact.id);
+      trace.push({ step: "associateNoteToContact", noteId, contactId: contact.id });
+      created++;
     }
-    return res.status(200).json({ ok: true, created: vehicles.length });
+
+    return res.status(200).json({ ok: true, created, ...(debug ? { trace } : {}) });
   } catch (err) {
-    console.error("POST /api/hubspot/vehicles/sync error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
+    const status = err.response?.status || 500;
+    const data = err.response?.data;
+    trace.push({ step: "error", status, hubspot: data || null, message: err.message });
+    return res.status(500).json({ error: "server_error", trace });
   }
-});
-
-// ----- Back-compat aliases -----
-app.get("/vehicles", (req, res) => {
-  req.url = "/api/hubspot/vehicles" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
-  app._router.handle(req, res);
-});
-
-app.post("/vehicles/sync", (req, res) => {
-  req.url = "/api/hubspot/vehicles/sync";
-  app._router.handle(req, res);
 });
 
 // JSON 404
