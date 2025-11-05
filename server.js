@@ -56,18 +56,32 @@ async function getNotesByIds(ids) {
   return resp.data?.results || [];
 }
 
-// Try to extract JSON object from free-text, and accept without "type"
+async function deleteNotes(ids) {
+  if (!ids?.length) return;
+  const batch = 80;
+  for (let i = 0; i < ids.length; i += batch) {
+    const chunk = ids.slice(i, i + batch);
+    await hs.post("/crm/v3/objects/notes/batch/archive", { inputs: chunk.map((id) => ({ id })) });
+  }
+}
+
+async function createNote(body) {
+  const resp = await hs.post("/crm/v3/objects/notes", { properties: { hs_note_body: body } });
+  return resp.data?.id;
+}
+
+async function associateNoteToContact(noteId, contactId) {
+  await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
+}
+
+// Parsing helpers (relaxed)
 function extractVehicleFromBody(body) {
   if (!body || typeof body !== "string") return null;
-
-  // Direct JSON case
   try {
     const obj = JSON.parse(body);
     const v = normalize(obj);
     if (v) return v;
   } catch {}
-
-  // Embedded JSON {...} within text
   const start = body.indexOf("{");
   const end = body.lastIndexOf("}");
   if (start >= 0 && end > start) {
@@ -81,7 +95,6 @@ function extractVehicleFromBody(body) {
   return null;
 }
 
-// Accept if it has at least two of the known keys
 function normalize(obj) {
   if (!obj || typeof obj !== "object") return null;
   const keys = ["make","model","year","color","licensePlate","plate","lic","vehicle","car"];
@@ -98,14 +111,17 @@ function normalize(obj) {
   return null;
 }
 
+// ----- Routes -----
+
+// GET vehicles (canonical)
 app.get("/api/hubspot/vehicles", async (req, res) => {
   try {
     const email = String(req.query.email || "").trim();
     const debug = String(req.query.debug || "") === "1";
-    if (!email) return res.status(400).send(JSON.stringify({ error: "email is required" }));
+    if (!email) return res.status(400).json({ error: "email is required" });
 
     const contact = await getContactByEmail(email);
-    if (!contact) return res.status(200).send(JSON.stringify({ vehicles: [], debug: { reason: "no_contact" } }));
+    if (!contact) return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
 
     const noteIds = await getAssociatedNoteIds(contact.id);
     const notes = await getNotesByIds(noteIds);
@@ -121,23 +137,57 @@ app.get("/api/hubspot/vehicles", async (req, res) => {
     }
 
     const payload = { vehicles };
-    if (debug) {
-      payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
-    }
-    return res.status(200).send(JSON.stringify(payload));
+    if (debug) payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
+    return res.status(200).json(payload);
   } catch (err) {
     console.error("GET /api/hubspot/vehicles error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).send(JSON.stringify({ error: "server_error" }));
+    return res.status(err.response?.status || 500).json({ error: "server_error" });
   }
 });
 
-// Back-compat alias
+// POST sync vehicles (canonical)
+app.post("/api/hubspot/vehicles/sync", async (req, res) => {
+  try {
+    const { email, vehicles } = req.body || {};
+    if (!email || !Array.isArray(vehicles)) {
+      return res.status(400).json({ error: "email and vehicles[] are required" });
+    }
+    const contact = await getContactByEmail(email);
+    if (!contact) return res.status(404).json({ error: "contact_not_found" });
+
+    const noteIds = await getAssociatedNoteIds(contact.id);
+    await deleteNotes(noteIds);
+
+    for (const v of vehicles) {
+      const payload = JSON.stringify({
+        make: v.make || "",
+        model: v.model || "",
+        year: v.year || "",
+        color: v.color || "",
+        licensePlate: v.licensePlate || ""
+      });
+      const noteId = await createNote(payload);
+      await associateNoteToContact(noteId, contact.id);
+    }
+    return res.status(200).json({ ok: true, created: vehicles.length });
+  } catch (err) {
+    console.error("POST /api/hubspot/vehicles/sync error:", err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({ error: "server_error" });
+  }
+});
+
+// ----- Back-compat aliases -----
 app.get("/vehicles", (req, res) => {
   req.url = "/api/hubspot/vehicles" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
   app._router.handle(req, res);
 });
 
+app.post("/vehicles/sync", (req, res) => {
+  req.url = "/api/hubspot/vehicles/sync";
+  app._router.handle(req, res);
+});
+
 // JSON 404
-app.use((req, res) => res.status(404).send(JSON.stringify({ error: "not_found", path: req.originalUrl })));
+app.use((req, res) => res.status(404).json({ error: "not_found", path: req.originalUrl }));
 
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
