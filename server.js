@@ -49,14 +49,30 @@ async function getContactByEmail(email) {
   return resp.data?.results?.[0] || null;
 }
 
+// Prefer v3 associations; fall back to v4 if needed
 async function getAssociatedNoteIds(contactId) {
-  const r = await hs.get(
+  // v3: /crm/v3/objects/contacts/{id}/associations/notes
+  try {
+    const r3 = await hs.get(
+      `/crm/v3/objects/contacts/${contactId}/associations/notes?limit=100`
+    );
+    const ids3 = (r3.data?.results || [])
+      .map(x => x.id)
+      .filter(Boolean);
+    if (ids3.length) return ids3;
+    // if 0 returned, still try v4 in case your portal is on that path
+  } catch (e) {
+    // swallow and try v4
+  }
+
+  // v4: /crm/v4/objects/contacts/{id}/associations/notes
+  const r4 = await hs.get(
     `/crm/v4/objects/contacts/${contactId}/associations/notes?limit=100`
   );
-  const ids = (r.data?.results || [])
+  const ids4 = (r4.data?.results || [])
     .map(x => (x.to && x.to.id ? x.to.id : null))
     .filter(Boolean);
-  return ids;
+  return ids4;
 }
 
 async function getNotesByIds(ids) {
@@ -68,42 +84,78 @@ async function getNotesByIds(ids) {
   return resp.data?.results || [];
 }
 
-// Attempt to normalize a vehicle-looking object
+// ---------- Vehicle extraction ----------
 function normalize(obj) {
   if (!obj || typeof obj !== "object") return null;
   const keys = ["make", "model", "year", "color", "licensePlate", "plate", "name"];
   const score = keys.reduce((acc, k) => acc + (obj[k] ? 1 : 0), 0);
   if (score >= 2) {
     return {
+      name: obj.name || `${obj.make || ""} ${obj.model || ""}`.trim(),
       make: obj.make || "",
       model: obj.model || "",
       year: String(obj.year || ""),
       color: obj.color || "",
       licensePlate: obj.licensePlate || obj.plate || "",
-      name: obj.name || `${obj.make || ""} ${obj.model || ""}`.trim(),
+      plate: obj.plate || obj.licensePlate || "",
     };
   }
   return null;
 }
 
-function extractVehicleFromBody(body) {
-  if (!body || typeof body !== "string") return null;
-  try {
-    const obj = JSON.parse(body);
-    const v = normalize(obj);
-    if (v) return v;
-  } catch {}
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    const candidate = body.slice(start, end + 1);
-    try {
-      const obj = JSON.parse(candidate);
-      const v = normalize(obj);
-      if (v) return v;
-    } catch {}
+// returns an array of normalized vehicles (0..n) from a note body
+function extractVehiclesFromBody(body) {
+  const out = [];
+  if (!body || typeof body !== "string") return out;
+
+  const tryParseAny = (txt) => {
+    try { return JSON.parse(txt); } catch { return null; }
+  };
+
+  // 1) direct parse
+  let parsed = tryParseAny(body);
+
+  // 2) if HTML/text-wrapped, slice the outermost {...} or [...] and try again
+  if (!parsed) {
+    const firstBrace = body.indexOf("{");
+    const lastBrace = body.lastIndexOf("}");
+    const firstBracket = body.indexOf("[");
+    const lastBracket = body.lastIndexOf("]");
+    const hasObject = firstBrace >= 0 && lastBrace > firstBrace;
+    const hasArray = firstBracket >= 0 && lastBracket > firstBracket;
+
+    if (hasArray && (!hasObject || firstBracket < firstBrace)) {
+      parsed = tryParseAny(body.slice(firstBracket, lastBracket + 1));
+    }
+    if (!parsed && hasObject) {
+      parsed = tryParseAny(body.slice(firstBrace, lastBrace + 1));
+    }
   }
-  return null;
+
+  // 3) normalize into an array
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      const n = normalize(item);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+
+  if (parsed && typeof parsed === "object") {
+    // wrapper like { vehicles: [...] }
+    if (Array.isArray(parsed.vehicles)) {
+      for (const item of parsed.vehicles) {
+        const n = normalize(item);
+        if (n) out.push(n);
+      }
+      return out;
+    }
+    // single object vehicle
+    const n = normalize(parsed);
+    if (n) out.push(n);
+  }
+
+  return out;
 }
 
 // ---------- Routes ----------
@@ -125,9 +177,9 @@ async function handleGetVehicles(req, res) {
 
     for (const n of notes) {
       const body = n.properties?.hs_note_body || "";
-      const v = extractVehicleFromBody(body);
-      if (v) vehicles.push(v);
-      if (debug) raw.push({ id: n.id, body });
+      const arr = extractVehiclesFromBody(body);
+      if (arr.length) vehicles.push(...arr);
+      if (debug) raw.push({ id: n.id, bodyPreview: body.slice(0, 300) });
     }
 
     const payload = { vehicles };
@@ -146,7 +198,6 @@ async function handleGetVehicles(req, res) {
 }
 
 async function createNote(body) {
-  // Use epoch ms for hs_timestamp to avoid format edge cases
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: body,
@@ -156,7 +207,7 @@ async function createNote(body) {
   return resp.data?.id;
 }
 
-// *** FIXED: use v3 association endpoint with note_to_contact ***
+// v3 association (this fixed your POST earlier)
 async function associateNoteToContact(noteId, contactId) {
   await hs.put(
     `/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`
@@ -176,7 +227,6 @@ async function handleSyncVehicles(req, res) {
 
     let created = 0;
     for (const v of vehicles) {
-      // Persist a clean JSON body (supports either name/plate/color or make/model/year/licensePlate/color)
       const payload = JSON.stringify({
         name: v.name || `${v.make || ""} ${v.model || ""}`.trim(),
         make: v.make || "",
@@ -185,7 +235,6 @@ async function handleSyncVehicles(req, res) {
         color: v.color || "",
         licensePlate: v.licensePlate || v.plate || "",
       });
-
       const noteId = await createNote(payload);
       await associateNoteToContact(noteId, contact.id);
       created++;
@@ -193,7 +242,6 @@ async function handleSyncVehicles(req, res) {
 
     return res.status(200).json({ ok: true, created });
   } catch (err) {
-    // If HubSpot returns a 4xx/5xx, surface status and log payload for fast debugging
     const status = err.response?.status || 500;
     const data = err.response?.data || err.message;
     console.error("POST /vehicles/sync error:", data);
