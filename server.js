@@ -1,4 +1,3 @@
-
 import express from "express";
 import axios from "axios";
 import cors from "cors";
@@ -12,7 +11,7 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 if (!HUBSPOT_TOKEN) {
-  console.error("Missing HUBSPOT_TOKEN");
+  console.error("❌ Missing HUBSPOT_TOKEN");
   process.exit(1);
 }
 
@@ -33,24 +32,26 @@ const hs = axios.create({
   timeout: 20000,
 });
 
+// ---------- HubSpot helpers ----------
 async function getContactByEmail(email) {
   const resp = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
-    properties: ["email","firstname","lastname"],
     limit: 1,
   });
   return resp.data?.results?.[0] || null;
 }
 
 async function getAssociatedNoteIds(contactId) {
-  const resp = await hs.get(`/crm/v4/objects/contacts/${contactId}/associations/notes`, { params: { limit: 200 } });
+  const resp = await hs.get(`/crm/v4/objects/contacts/${contactId}/associations/notes`, {
+    params: { limit: 200 },
+  });
   return (resp.data?.results || []).map((r) => r.toObjectId);
 }
 
 async function getNotesByIds(ids) {
   if (!ids?.length) return [];
   const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
-    properties: ["hs_note_body","hs_timestamp"],
+    properties: ["hs_note_body", "hs_timestamp"],
     inputs: ids.map((id) => ({ id })),
   });
   return resp.data?.results || [];
@@ -58,20 +59,20 @@ async function getNotesByIds(ids) {
 
 async function deleteNotes(ids) {
   if (!ids?.length) return;
-  const batch = 80;
-  for (let i = 0; i < ids.length; i += batch) {
-    const chunk = ids.slice(i, i + batch);
-    await hs.post("/crm/v3/objects/notes/batch/archive", { inputs: chunk.map((id) => ({ id })) });
+  for (let i = 0; i < ids.length; i += 80) {
+    const chunk = ids.slice(i, i + 80);
+    await hs.post("/crm/v3/objects/notes/batch/archive", {
+      inputs: chunk.map((id) => ({ id })),
+    });
   }
 }
 
 async function createNote(body) {
-  // HubSpot requires hs_timestamp
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: body,
-      hs_timestamp: Date.now()
-    }
+      hs_timestamp: Date.now(),
+    },
   });
   return resp.data?.id;
 }
@@ -80,81 +81,76 @@ async function associateNoteToContact(noteId, contactId) {
   await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
 }
 
-// ---- parsing helpers (relaxed) ----
+// ---------- JSON parser ----------
 function extractVehicleFromBody(body) {
   if (!body || typeof body !== "string") return null;
   try {
     const obj = JSON.parse(body);
-    const v = normalize(obj);
-    if (v) return v;
-  } catch {}
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    const candidate = body.slice(start, end + 1);
-    try {
-      const obj = JSON.parse(candidate);
-      const v = normalize(obj);
-      if (v) return v;
-    } catch {}
+    return normalize(obj);
+  } catch {
+    const start = body.indexOf("{");
+    const end = body.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        const obj = JSON.parse(body.slice(start, end + 1));
+        return normalize(obj);
+      } catch {
+        return null;
+      }
+    }
   }
   return null;
 }
 
 function normalize(obj) {
   if (!obj || typeof obj !== "object") return null;
-  const keys = ["make","model","year","color","licensePlate","plate","lic","vehicle","car"];
-  const score = keys.reduce((acc,k) => acc + (obj[k] ? 1 : 0), 0);
+  const keys = ["make", "model", "year", "color", "licensePlate", "plate", "name"];
+  const score = keys.reduce((acc, k) => acc + (obj[k] ? 1 : 0), 0);
   if (score >= 2) {
     return {
       make: obj.make || "",
       model: obj.model || "",
-      year: String(obj.year || ""),
+      year: obj.year || "",
       color: obj.color || "",
-      licensePlate: obj.licensePlate || obj.plate || obj.lic || ""
+      licensePlate: obj.licensePlate || obj.plate || "",
+      name: obj.name || [obj.year, obj.make, obj.model].filter(Boolean).join(" "),
     };
   }
   return null;
 }
 
-// ---- handlers ----
-async function handleGetVehicles(req, res) {
+// ---------- Routes ----------
+app.get(["/vehicles", "/api/hubspot/vehicles"], async (req, res) => {
   try {
     const email = String(req.query.email || "").trim();
-    const debug = String(req.query.debug || "") === "1";
-    if (!email) return res.status(400).json({ error: "email is required" });
+    if (!email) return res.status(400).json({ error: "email_required" });
 
     const contact = await getContactByEmail(email);
-    if (!contact) return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
+    if (!contact) return res.status(200).json({ vehicles: [] });
 
     const noteIds = await getAssociatedNoteIds(contact.id);
     const notes = await getNotesByIds(noteIds);
 
     const vehicles = [];
-    const raw = [];
-
     for (const n of notes) {
-      const body = n.properties?.hs_note_body || "";
-      const v = extractVehicleFromBody(body);
-      if (v) vehicles.push(v);
-      if (debug) raw.push({ id: n.id, body });
+      const parsed = extractVehicleFromBody(n.properties?.hs_note_body || "");
+      if (parsed) vehicles.push(parsed);
     }
 
-    const payload = { vehicles };
-    if (debug) payload.debug = { contactId: contact.id, noteIds, totalNotes: notes.length, rawBodies: raw };
-    return res.status(200).json(payload);
+    return res.status(200).json({ vehicles });
   } catch (err) {
-    console.error("GET vehicles error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
+    console.error("GET /vehicles error:", err.response?.data || err.message);
+    return res.status(500).json({ error: "server_error", detail: err.message });
   }
-}
+});
 
-async function handleSyncVehicles(req, res) {
+app.post(["/vehicles/sync", "/api/hubspot/vehicles/sync"], async (req, res) => {
   try {
     const { email, vehicles } = req.body || {};
     if (!email || !Array.isArray(vehicles)) {
-      return res.status(400).json({ error: "email and vehicles[] are required" });
+      return res.status(400).json({ error: "email_and_vehicles_required" });
     }
+
     const contact = await getContactByEmail(email);
     if (!contact) return res.status(404).json({ error: "contact_not_found" });
 
@@ -162,32 +158,27 @@ async function handleSyncVehicles(req, res) {
     await deleteNotes(noteIds);
 
     for (const v of vehicles) {
-      const payload = JSON.stringify({
-        make: v.make || "",
-        model: v.model || "",
-        year: v.year || "",
-        color: v.color || "",
-        licensePlate: v.licensePlate || ""
-      });
-      const noteId = await createNote(payload);
+      const noteId = await createNote(
+        JSON.stringify({
+          name: v.name || "",
+          make: v.make || "",
+          model: v.model || "",
+          year: v.year || "",
+          color: v.color || "",
+          licensePlate: v.plate || v.licensePlate || "",
+        })
+      );
       await associateNoteToContact(noteId, contact.id);
     }
 
     return res.status(200).json({ ok: true, created: vehicles.length });
   } catch (err) {
-    console.error("POST vehicles/sync error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
+    console.error("POST /vehicles/sync error:", err.response?.data || err.message);
+    return res.status(500).json({ error: "server_error", detail: err.message });
   }
-}
+});
 
-// ---- routes (canonical + aliases) ----
-app.get("/api/hubspot/vehicles", handleGetVehicles);
-app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
-
-app.get("/vehicles", handleGetVehicles);
-app.post("/vehicles/sync", handleSyncVehicles);
-
-// JSON 404
+// ---------- 404 JSON ----------
 app.use((req, res) => res.status(404).json({ error: "not_found", path: req.originalUrl }));
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, () => console.log(`✅ HubSpot BFF running on port ${PORT}`));
