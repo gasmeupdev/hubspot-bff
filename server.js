@@ -1,3 +1,4 @@
+
 import express from "express";
 import axios from "axios";
 import cors from "cors";
@@ -51,27 +52,17 @@ async function getContactByEmail(email) {
 
 // Prefer v3 associations; fall back to v4 if needed
 async function getAssociatedNoteIds(contactId) {
-  // v3: /crm/v3/objects/contacts/{id}/associations/notes
+  // v3
   try {
-    const r3 = await hs.get(
-      `/crm/v3/objects/contacts/${contactId}/associations/notes?limit=100`
-    );
-    const ids3 = (r3.data?.results || [])
-      .map(x => x.id)
-      .filter(Boolean);
+    const r3 = await hs.get(`/crm/v3/objects/contacts/${contactId}/associations/notes?limit=100`);
+    const ids3 = (r3.data?.results || []).map(x => x.id).filter(Boolean);
     if (ids3.length) return ids3;
-    // if 0 returned, still try v4 in case your portal is on that path
   } catch (e) {
-    // swallow and try v4
+    // ignore, try v4
   }
-
-  // v4: /crm/v4/objects/contacts/{id}/associations/notes
-  const r4 = await hs.get(
-    `/crm/v4/objects/contacts/${contactId}/associations/notes?limit=100`
-  );
-  const ids4 = (r4.data?.results || [])
-    .map(x => (x.to && x.to.id ? x.to.id : null))
-    .filter(Boolean);
+  // v4
+  const r4 = await hs.get(`/crm/v4/objects/contacts/${contactId}/associations/notes?limit=100`);
+  const ids4 = (r4.data?.results || []).map(x => (x.to && x.to.id ? x.to.id : null)).filter(Boolean);
   return ids4;
 }
 
@@ -82,6 +73,30 @@ async function getNotesByIds(ids) {
     inputs: ids.map(id => ({ id })),
   });
   return resp.data?.results || [];
+}
+
+// Archive (delete) a batch of notes
+async function deleteExistingNotes(contactId) {
+  const ids = await getAssociatedNoteIds(contactId);
+  if (!ids.length) return 0;
+  try {
+    await hs.post("/crm/v3/objects/notes/batch/archive", {
+      inputs: ids.map(id => ({ id })),
+    });
+    return ids.length;
+  } catch (err) {
+    // Fallback: delete one-by-one if batch/archive not available in this portal
+    let deleted = 0;
+    for (const id of ids) {
+      try {
+        await hs.delete(`/crm/v3/objects/notes/${id}`);
+        deleted++;
+      } catch {
+        // continue
+      }
+    }
+    return deleted;
+  }
 }
 
 // ---------- Vehicle extraction ----------
@@ -207,14 +222,12 @@ async function createNote(body) {
   return resp.data?.id;
 }
 
-// v3 association (this fixed your POST earlier)
+// v3 association to contact
 async function associateNoteToContact(noteId, contactId) {
-  await hs.put(
-    `/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`
-  );
+  await hs.put(`/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
 }
 
-// Create NEW note(s) only; do NOT delete old ones
+// Create NEW note(s) but first delete existing ones
 async function handleSyncVehicles(req, res) {
   try {
     const { email, vehicles } = req.body || {};
@@ -225,6 +238,10 @@ async function handleSyncVehicles(req, res) {
     const contact = await getContactByEmail(email);
     if (!contact) return res.status(404).json({ error: "contact_not_found" });
 
+    // STEP 1: delete current notes for that contact
+    const removed = await deleteExistingNotes(contact.id);
+
+    // STEP 2: create new notes
     let created = 0;
     for (const v of vehicles) {
       const payload = JSON.stringify({
@@ -240,7 +257,7 @@ async function handleSyncVehicles(req, res) {
       created++;
     }
 
-    return res.status(200).json({ ok: true, created });
+    return res.status(200).json({ ok: true, deleted: removed, created });
   } catch (err) {
     const status = err.response?.status || 500;
     const data = err.response?.data || err.message;
