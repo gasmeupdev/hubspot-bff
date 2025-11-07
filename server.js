@@ -39,6 +39,7 @@ const hs = axios.create({
   timeout: 20000,
 });
 
+// ---------- HubSpot helpers ----------
 async function getContactByEmail(email) {
   const resp = await hs.post("/crm/v3/objects/contacts/search", {
     filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
@@ -60,7 +61,6 @@ async function getAssociatedNoteIds(contactId) {
 
 async function getNotesByIds(ids) {
   if (!ids?.length) return [];
-  // batch read
   const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
     properties: ["hs_note_body", "hs_timestamp"],
     inputs: ids.map(id => ({ id })),
@@ -68,9 +68,10 @@ async function getNotesByIds(ids) {
   return resp.data?.results || [];
 }
 
+// Attempt to normalize a vehicle-looking object
 function normalize(obj) {
   if (!obj || typeof obj !== "object") return null;
-  const keys = ["make", "model", "year", "color", "licensePlate", "plate", "lic", "vehicle", "car"];
+  const keys = ["make", "model", "year", "color", "licensePlate", "plate", "name"];
   const score = keys.reduce((acc, k) => acc + (obj[k] ? 1 : 0), 0);
   if (score >= 2) {
     return {
@@ -78,7 +79,8 @@ function normalize(obj) {
       model: obj.model || "",
       year: String(obj.year || ""),
       color: obj.color || "",
-      licensePlate: obj.licensePlate || obj.plate || obj.lic || "",
+      licensePlate: obj.licensePlate || obj.plate || "",
+      name: obj.name || `${obj.make || ""} ${obj.model || ""}`.trim(),
     };
   }
   return null;
@@ -104,7 +106,7 @@ function extractVehicleFromBody(body) {
   return null;
 }
 
-// ---- handlers ----
+// ---------- Routes ----------
 async function handleGetVehicles(req, res) {
   try {
     const email = String(req.query.email || "").trim();
@@ -138,47 +140,52 @@ async function handleGetVehicles(req, res) {
       };
     return res.status(200).json(payload);
   } catch (err) {
-    console.error("GET vehicles error:", err.response?.data || err.message);
+    console.error("GET /vehicles error:", err.response?.data || err.message);
     return res.status(err.response?.status || 500).json({ error: "server_error" });
   }
 }
 
 async function createNote(body) {
-  // HubSpot requires hs_timestamp
+  // Use epoch ms for hs_timestamp to avoid format edge cases
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: body,
-      hs_timestamp: new Date().toISOString(),
+      hs_timestamp: Date.now(),
     },
   });
   return resp.data?.id;
 }
 
+// *** FIXED: use v3 association endpoint with note_to_contact ***
 async function associateNoteToContact(noteId, contactId) {
-  await hs.put(`/crm/v4/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`, {
-    associationCategory: "HUBSPOT_DEFINED",
-    associationTypeId: 202, // note_to_contact
-  });
+  await hs.put(
+    `/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`
+  );
 }
 
-// --- SAVE: create new notes only (no deletions) ---
+// Create NEW note(s) only; do NOT delete old ones
 async function handleSyncVehicles(req, res) {
   try {
     const { email, vehicles } = req.body || {};
     if (!email || !Array.isArray(vehicles)) {
       return res.status(400).json({ error: "email and vehicles[] are required" });
     }
+
     const contact = await getContactByEmail(email);
     if (!contact) return res.status(404).json({ error: "contact_not_found" });
 
-    // Create one new Note per vehicle containing { name, plate, color } JSON
     let created = 0;
     for (const v of vehicles) {
+      // Persist a clean JSON body (supports either name/plate/color or make/model/year/licensePlate/color)
       const payload = JSON.stringify({
-        name: v.name || "",
-        plate: v.plate || "",
+        name: v.name || `${v.make || ""} ${v.model || ""}`.trim(),
+        make: v.make || "",
+        model: v.model || "",
+        year: v.year || "",
         color: v.color || "",
+        licensePlate: v.licensePlate || v.plate || "",
       });
+
       const noteId = await createNote(payload);
       await associateNoteToContact(noteId, contact.id);
       created++;
@@ -186,12 +193,15 @@ async function handleSyncVehicles(req, res) {
 
     return res.status(200).json({ ok: true, created });
   } catch (err) {
-    console.error("POST vehicles/sync error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
+    // If HubSpot returns a 4xx/5xx, surface status and log payload for fast debugging
+    const status = err.response?.status || 500;
+    const data = err.response?.data || err.message;
+    console.error("POST /vehicles/sync error:", data);
+    return res.status(status).json({ error: "server_error", details: data });
   }
 }
 
-// ---- routes (canonical + aliases) ----
+// ---- route bindings ----
 app.get("/api/hubspot/vehicles", handleGetVehicles);
 app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
 
