@@ -339,6 +339,29 @@ app.post("/contacts", async (req, res) => {
 });
 // === END new route =====================================================
 
+// === NEW: read contact job title by email ================================
+// GET /contacts/status?email=someone@example.com
+// Returns: { jobTitle: string|null }
+app.get("/contacts/status", async (req, res) => {
+  try {
+    const email = String(req.query.email || "").trim();
+    if (!email) return res.status(400).json({ jobTitle: null });
+
+    const searchResp = await hs.post("/crm/v3/objects/contacts/search", {
+      filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
+      properties: ["jobtitle"],
+      limit: 1,
+    });
+
+    const contact = searchResp.data?.results?.[0];
+    const jobTitle = contact?.properties?.jobtitle ?? null;
+    return res.json({ jobTitle });
+  } catch (err) {
+    console.error("GET /contacts/status error:", err.response?.data || err.message);
+    return res.status(500).json({ jobTitle: null });
+  }
+});
+// === END new route =======================================================
 
 
 
