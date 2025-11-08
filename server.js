@@ -273,6 +273,75 @@ app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
 app.get("/vehicles", handleGetVehicles);
 app.post("/vehicles/sync", handleSyncVehicles);
 
+
+// === NEW: Create/Upsert HubSpot Contact ================================
+app.post("/contacts", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+    const firstName = req.body?.firstName?.toString() ?? "";
+    const lastName  = req.body?.lastName?.toString() ?? "";
+    const phone     = req.body?.phone?.toString() ?? "";
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: "email is required" });
+    }
+
+    // 1) Look for existing contact by email
+    const searchResp = await hs.post("/crm/v3/objects/contacts/search", {
+      filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: email }] }],
+      properties: ["email", "firstname", "lastname", "phone"],
+      limit: 1,
+    });
+    const existing = searchResp.data?.results?.[0];
+
+    // 2) Update or Create
+    if (existing?.id) {
+      const contactId = existing.id;
+      const props = {};
+      if (email)     props.email = email;
+      if (firstName) props.firstname = firstName;
+      if (lastName)  props.lastname  = lastName;
+      if (phone)     props.phone     = phone;
+
+      if (Object.keys(props).length > 0) {
+        await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties: props });
+      }
+
+      return res.status(200).json({
+        success: true,
+        contactId,
+        created: false,
+        updated: true,
+      });
+    } else {
+      const createResp = await hs.post("/crm/v3/objects/contacts", {
+        properties: {
+          email,
+          ...(firstName ? { firstname: firstName } : {}),
+          ...(lastName  ? { lastname:  lastName }  : {}),
+          ...(phone     ? { phone } : {}),
+        },
+      });
+
+      return res.status(201).json({
+        success: true,
+        contactId: createResp.data?.id,
+        created: true,
+        updated: false,
+      });
+    }
+  } catch (err) {
+    const status  = err.response?.status || 500;
+    const details = err.response?.data || err.message;
+    console.error("POST /contacts error:", details);
+    return res.status(status).json({ success: false, message: "server_error", details });
+  }
+});
+// === END new route =====================================================
+
+
+
+
 // JSON 404
 app.use((req, res) =>
   res.status(404).json({ error: "not_found", path: req.originalUrl })
