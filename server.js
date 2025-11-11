@@ -1,8 +1,8 @@
-
 import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
+import Stripe from "stripe"; // ← added
 
 dotenv.config();
 
@@ -362,6 +362,75 @@ app.get("/contacts/status", async (req, res) => {
   }
 });
 // === END new route =======================================================
+
+
+
+// ========================== STRIPE (ADDED) ===============================
+
+// env vars expected: STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
+
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
+  : null;
+
+// Helper: find or create Stripe Customer by email
+async function getOrCreateStripeCustomerByEmail(email) {
+  const existing = await stripe.customers.list({ email, limit: 1 });
+  if (existing.data.length > 0) return existing.data[0];
+  return await stripe.customers.create({ email, description: "Gas Me Up app user" });
+}
+
+// Returns publishable key for iOS app
+app.get("/stripe/publishable-key", (_req, res) => {
+  if (!STRIPE_PUBLISHABLE_KEY) {
+    return res.status(500).json({ error: "Missing STRIPE_PUBLISHABLE_KEY" });
+  }
+  return res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
+});
+
+// Init $25 signup payment: Customer + Ephemeral Key + PaymentIntent
+app.post("/stripe/init-subscription-payment", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = String(req.body?.email || "").trim() || "test-user@example.com";
+
+    // 1) ensure customer
+    const customer = await getOrCreateStripeCustomerByEmail(email);
+
+    // 2) ephemeral key (must pass apiVersion)
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2023-10-16" }
+    );
+
+    // 3) payment intent for $25, and save method for future off-session use
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: 2500,
+      currency: "usd",
+      customer: customer.id,
+      automatic_payment_methods: { enabled: true },
+      setup_future_usage: "off_session",
+      metadata: { hubspot_email: email, app_source: "ios_signup" },
+    });
+
+    return res.json({
+      email,
+      customerId: customer.id,
+      ephemeralKeySecret: ephemeralKey.secret,
+      paymentIntentClientSecret: paymentIntent.client_secret,
+    });
+  } catch (err) {
+    console.error("init-subscription-payment error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
+
+// ======================== END STRIPE (ADDED) =============================
 
 
 
