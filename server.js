@@ -134,7 +134,6 @@ function extractVehiclesFromBody(body) {
   if (!parsed) {
     const firstBrace = body.indexOf("{");
     const lastBrace = body.lastIndexOf("}");
-    the:
     const firstBracket = body.indexOf("[");
     const lastBracket = body.lastIndexOf("]");
     const hasObject = firstBrace >= 0 && lastBrace > firstBrace;
