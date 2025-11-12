@@ -410,7 +410,7 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
 
     // 3) payment intent for $25, and save method for future off-session use
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: 2500,
+      amount: 25,
       currency: "usd",
       customer: customer.id,
       automatic_payment_methods: { enabled: true },
