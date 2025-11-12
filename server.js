@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
-import Stripe from "stripe"; // ← added
+import Stripe from "stripe"; // ← added (kept)
 
 dotenv.config();
 
@@ -365,9 +365,8 @@ app.get("/contacts/status", async (req, res) => {
 
 
 
-// ========================== STRIPE (ADDED) ===============================
+// ========================== STRIPE (ADDED/UPDATED) ===============================
 
-// env vars expected: STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 
@@ -375,11 +374,24 @@ const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
   : null;
 
-// Helper: find or create Stripe Customer by email
-async function getOrCreateStripeCustomerByEmail(email) {
+// Helper: find or create Stripe Customer by email, and keep name in sync
+async function getOrCreateStripeCustomerByEmail(email, name) {
+  if (!stripe) throw new Error("Stripe not configured");
   const existing = await stripe.customers.list({ email, limit: 1 });
-  if (existing.data.length > 0) return existing.data[0];
-  return await stripe.customers.create({ email, description: "Gas Me Up app user" });
+  if (existing.data.length > 0) {
+    const customer = existing.data[0];
+    // If we have a new name, update it (no-op if same/empty)
+    if (name && name !== customer.name) {
+      await stripe.customers.update(customer.id, { name });
+    }
+    return customer;
+  }
+  // Create with name + email
+  return await stripe.customers.create({
+    email,
+    name: name || undefined,
+    description: "Gas Me Up app user",
+  });
 }
 
 // Returns publishable key for iOS app
@@ -390,7 +402,8 @@ app.get("/stripe/publishable-key", (_req, res) => {
   return res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
-// Init $25 signup payment: Customer + Ephemeral Key + PaymentIntent
+// (kept) Old flow for one-off charge (if you still need it):
+// Init $X signup payment via PaymentIntent (charge now + save for later)
 app.post("/stripe/init-subscription-payment", async (req, res) => {
   try {
     if (!stripe) {
@@ -398,19 +411,19 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
     }
 
     const email = String(req.body?.email || "").trim() || "test-user@example.com";
+    const name  = (req.body?.name || "").toString().trim();
 
-    // 1) ensure customer
-    const customer = await getOrCreateStripeCustomerByEmail(email);
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
 
-    // 2) ephemeral key (must pass apiVersion)
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: "2023-10-16" }
     );
 
-    // 3) payment intent for $25, and save method for future off-session use
+    const amountCents = Number.isFinite(req.body?.amountCents) ? req.body.amountCents : 2500; // default $25
+
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: 25,
+      amount: amountCents,
       currency: "usd",
       customer: customer.id,
       automatic_payment_methods: { enabled: true },
@@ -430,7 +443,104 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
   }
 });
 
-// ======================== END STRIPE (ADDED) =============================
+// NEW: SetupIntent flow to save card first (attach to customer)
+// Client will present PaymentSheet with a SetupIntent, then we can invoice a Product/Price.
+app.post("/stripe/init-setup", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+    const email = String(req.body?.email || "").trim() || "test-user@example.com";
+    const name  = (req.body?.name || "").toString().trim();
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2023-10-16" }
+    );
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customer.id,
+      usage: "off_session",
+      payment_method_types: ["card", "link"],
+      metadata: { hubspot_email: email, app_source: "ios_setup" },
+    });
+
+    return res.json({
+      email,
+      customerId: customer.id,
+      ephemeralKeySecret: ephemeralKey.secret,
+      setupIntentClientSecret: setupIntent.client_secret,
+    });
+  } catch (err) {
+    console.error("init-setup error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
+
+// NEW: Create and finalize an invoice that includes your Product via an existing Price
+// Request body: { email, name, priceId, quantity? (default 1) }
+// Behavior:
+// - Ensures Customer exists with correct name/email
+// - Creates InvoiceItem(s) using priceId
+// - Creates Invoice with collection_method='charge_automatically'
+// - Sets default_payment_method if Customer has one saved (best effort)
+// - Finalizes the invoice (and Stripe attempts to pay if a default PM exists)
+app.post("/stripe/invoice/create", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email    = String(req.body?.email || "").trim();
+    const name     = (req.body?.name || "").toString().trim();
+    const priceId  = (req.body?.priceId || "").toString().trim(); // e.g., price_123 linked to your product
+    const quantity = Number.isFinite(req.body?.quantity) && req.body.quantity > 0 ? req.body.quantity : 1;
+
+    if (!email || !priceId) {
+      return res.status(400).json({ error: { message: "email and priceId are required" } });
+    }
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    // Try to find a saved card and set it as default for this invoice (best effort)
+    const pmList = await stripe.paymentMethods.list({ customer: customer.id, type: "card" });
+    const defaultPm = pmList.data?.[0]?.id;
+
+    // Create an invoice item that references your existing Price (Product)
+    await stripe.invoiceItems.create({
+      customer: customer.id,
+      price: priceId,
+      quantity,
+      // You can add metadata or overrides here if needed
+    });
+
+    // Create the invoice (charge automatically if PM exists)
+    const invoice = await stripe.invoices.create({
+      customer: customer.id,
+      collection_method: "charge_automatically",
+      ...(defaultPm ? { default_payment_method: defaultPm } : {}),
+      metadata: { hubspot_email: email, app_source: "ios_invoice" },
+      auto_advance: true
+    });
+
+    // Finalize the invoice (attempts payment if default PM is set / saved)
+    const finalized = await stripe.invoices.finalizeInvoice(invoice.id);
+
+    return res.json({
+      invoiceId: finalized.id,
+      status: finalized.status,
+      hostedInvoiceUrl: finalized.hosted_invoice_url,
+      customerId: customer.id
+    });
+  } catch (err) {
+    console.error("invoice/create error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
+
+// ======================== END STRIPE (ADDED/UPDATED) =============================
 
 
 
