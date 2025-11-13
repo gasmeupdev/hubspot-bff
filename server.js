@@ -10,6 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const PORTAL_RETURN_URL = process.env.PORTAL_RETURN_URL || "https://gasmeuppgh.com";
+
 
 if (!HUBSPOT_TOKEN) {
   console.error("Missing HUBSPOT_TOKEN");
@@ -404,6 +406,34 @@ app.get("/stripe/publishable-key", (_req, res) => {
     return res.status(500).json({ error: "Missing STRIPE_PUBLISHABLE_KEY" });
   }
   return res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
+});
+
+// Create a Stripe Billing Portal session for managing payment methods
+app.post("/stripe/create-portal-session", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = (req.body?.email ?? "").toString().trim();
+    if (!email) {
+      return res.status(400).json({ error: { message: "email required" } });
+    }
+
+    const name = (req.body?.name ?? "").toString().trim() || undefined;
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: PORTAL_RETURN_URL,
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("create-portal-session error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "portal_error" } });
+  }
 });
 
 // One-off charge via PaymentIntent (kept). Now REQUIRES real email; accepts optional name.
