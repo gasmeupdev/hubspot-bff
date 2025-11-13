@@ -16,20 +16,6 @@ if (!HUBSPOT_TOKEN) {
   process.exit(1);
 }
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
-const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
-
-let stripe = null;
-if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
-  console.warn(
-    "Stripe keys not fully configured. STRIPE_SECRET_KEY and STRIPE_PUBLISHABLE_KEY are required for payment endpoints."
-  );
-} else {
-  stripe = new Stripe(STRIPE_SECRET_KEY, {
-    apiVersion: "2023-10-16",
-  });
-}
-
 // --- middleware ---
 app.use(
   cors({
@@ -64,27 +50,6 @@ async function getContactByEmail(email) {
   return resp.data?.results?.[0] || null;
 }
 
-async function markContactAsSubscriberByEmail(email) {
-  if (!email) return null;
-  try {
-    const contact = await getContactByEmail(email);
-    if (!contact || !contact.id) {
-      console.warn("markContactAsSubscriberByEmail: no contact found for email", email);
-      return null;
-    }
-    const contactId = contact.id;
-    await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
-      properties: {
-        jobtitle: "1",
-      },
-    });
-    return contactId;
-  } catch (err) {
-    console.error("markContactAsSubscriberByEmail error:", err.response?.data || err.message || err);
-    return null;
-  }
-}
-
 // Prefer v3 associations; fall back to v4 if needed
 async function getAssociatedNoteIds(contactId) {
   // v3
@@ -104,96 +69,215 @@ async function getAssociatedNoteIds(contactId) {
 async function getNotesByIds(ids) {
   if (!ids?.length) return [];
   const resp = await hs.post("/crm/v3/objects/notes/batch/read", {
-    properties: ["hs_note_body"],
+    properties: ["hs_note_body", "hs_timestamp"],
     inputs: ids.map(id => ({ id })),
   });
-  const map = {};
-  (resp.data?.results || []).forEach(r => {
-    if (r.id && r.properties?.hs_note_body != null) {
-      map[r.id] = r.properties.hs_note_body;
-    }
-  });
-  return ids
-    .map(id => ({
-      id,
-      body: map[id] || "",
-    }))
-    .filter(x => x.body && x.body.length > 0);
+  return resp.data?.results || [];
 }
 
-async function deleteNotesByIds(ids) {
-  if (!ids?.length) return;
-
-  const chunks = [];
-  for (let i = 0; i < ids.length; i += 100) {
-    chunks.push(ids.slice(i, i + 100));
-  }
-
-  for (const chunk of chunks) {
-    try {
-      await hs.post("/crm/v3/objects/notes/batch/archive", {
-        inputs: chunk.map(id => ({ id })),
-      });
-    } catch (err) {
-      console.error("deleteNotesByIds error:", err.response?.data || err.message || err);
+// Archive (delete) a batch of notes
+async function deleteExistingNotes(contactId) {
+  const ids = await getAssociatedNoteIds(contactId);
+  if (!ids.length) return 0;
+  try {
+    await hs.post("/crm/v3/objects/notes/batch/archive", {
+      inputs: ids.map(id => ({ id })),
+    });
+    return ids.length;
+  } catch (err) {
+    // Fallback: delete one-by-one if batch/archive not available in this portal
+    let deleted = 0;
+    for (const id of ids) {
+      try {
+        await hs.delete(`/crm/v3/objects/notes/${id}`);
+        deleted++;
+      } catch {
+        // continue
+      }
     }
+    return deleted;
   }
 }
 
-async function createNoteForContact(contactId, body) {
+// ---------- Vehicle extraction ----------
+function normalize(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const keys = ["make", "model", "year", "color", "licensePlate", "plate", "name"];
+  const score = keys.reduce((acc, k) => acc + (obj[k] ? 1 : 0), 0);
+  if (score >= 2) {
+    return {
+      name: obj.name || `${obj.make || ""} ${obj.model || ""}`.trim(),
+      make: obj.make || "",
+      model: obj.model || "",
+      year: String(obj.year || ""),
+      color: obj.color || "",
+      licensePlate: obj.licensePlate || obj.plate || "",
+      plate: obj.plate || obj.licensePlate || "",
+    };
+  }
+  return null;
+}
+
+// returns an array of normalized vehicles (0..n) from a note body
+function extractVehiclesFromBody(body) {
+  const out = [];
+  if (!body || typeof body !== "string") return out;
+
+  const tryParseAny = (txt) => {
+    try { return JSON.parse(txt); } catch { return null; }
+  };
+
+  // 1) direct parse
+  let parsed = tryParseAny(body);
+
+  // 2) if HTML/text-wrapped, slice the outermost {...} or [...] and try again
+  if (!parsed) {
+    const firstBrace = body.indexOf("{");
+    const lastBrace = body.lastIndexOf("}");
+    const firstBracket = body.indexOf("[");
+    const lastBracket = body.lastIndexOf("]");
+    const hasObject = firstBrace >= 0 && lastBrace > firstBrace;
+    const hasArray = firstBracket >= 0 && lastBracket > firstBracket;
+
+    if (hasArray && (!hasObject || firstBracket < firstBrace)) {
+      parsed = tryParseAny(body.slice(firstBracket, lastBracket + 1));
+    }
+    if (!parsed && hasObject) {
+      parsed = tryParseAny(body.slice(firstBrace, lastBrace + 1));
+    }
+  }
+
+  // 3) normalize into an array
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      const n = normalize(item);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+
+  if (parsed && typeof parsed === "object") {
+    // wrapper like { vehicles: [...] }
+    if (Array.isArray(parsed.vehicles)) {
+      for (const item of parsed.vehicles) {
+        const n = normalize(item);
+        if (n) out.push(n);
+      }
+      return out;
+    }
+    // single object vehicle
+    const n = normalize(parsed);
+    if (n) out.push(n);
+  }
+
+  return out;
+}
+
+// ---------- Routes ----------
+async function handleGetVehicles(req, res) {
+  try {
+    const email = String(req.query.email || "").trim();
+    const debug = String(req.query.debug || "") === "1";
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const contact = await getContactByEmail(email);
+    if (!contact)
+      return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
+
+    const noteIds = await getAssociatedNoteIds(contact.id);
+    const notes = await getNotesByIds(noteIds);
+
+    const vehicles = [];
+    const raw = [];
+
+    for (const n of notes) {
+      const body = n.properties?.hs_note_body || "";
+      const arr = extractVehiclesFromBody(body);
+      if (arr.length) vehicles.push(...arr);
+      if (debug) raw.push({ id: n.id, bodyPreview: body.slice(0, 300) });
+    }
+
+    const payload = { vehicles };
+    if (debug)
+      payload.debug = {
+        contactId: contact.id,
+        noteIds,
+        totalNotes: notes.length,
+        rawBodies: raw,
+      };
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error("GET /vehicles error:", err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({ error: "server_error" });
+  }
+}
+
+async function createNote(body) {
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: body,
+      hs_timestamp: Date.now(),
     },
-    associations: [
-      {
-        to: { id: String(contactId) },
-        types: [
-          {
-            associationCategory: "HUBSPOT_DEFINED",
-            associationTypeId: 202, // Contact to note association
-          },
-        ],
-      },
-    ],
   });
-  return resp.data;
+  return resp.data?.id;
 }
 
-// -------- Vehicles <-> JSON note helpers --------
-
-function vehiclesToJsonNoteBody(vehicles) {
-  const payload = {
-    vehicles: vehicles || [],
-  };
-  return JSON.stringify(payload);
+// v3 association to contact
+async function associateNoteToContact(noteId, contactId) {
+  await hs.put(`/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`);
 }
 
-function parseVehiclesFromNoteBody(body) {
-  if (!body || typeof body !== "string") return [];
+// Create NEW note(s) but first delete existing ones
+async function handleSyncVehicles(req, res) {
   try {
-    const parsed = JSON.parse(body);
-    if (!parsed || typeof parsed !== "object") return [];
-    if (!Array.isArray(parsed.vehicles)) return [];
-    return parsed.vehicles;
-  } catch (e) {
-    return [];
+    const { email, vehicles } = req.body || {};
+    if (!email || !Array.isArray(vehicles)) {
+      return res.status(400).json({ error: "email and vehicles[] are required" });
+    }
+
+    const contact = await getContactByEmail(email);
+    if (!contact) return res.status(404).json({ error: "contact_not_found" });
+
+    // STEP 1: delete current notes for that contact
+    const removed = await deleteExistingNotes(contact.id);
+
+    // STEP 2: create new notes
+    let created = 0;
+    for (const v of vehicles) {
+      const payload = JSON.stringify({
+        name: v.name || `${v.make || ""} ${v.model || ""}`.trim(),
+        make: v.make || "",
+        model: v.model || "",
+        year: v.year || "",
+        color: v.color || "",
+        licensePlate: v.licensePlate || v.plate || "",
+      });
+      const noteId = await createNote(payload);
+      await associateNoteToContact(noteId, contact.id);
+      created++;
+    }
+
+    return res.status(200).json({ ok: true, deleted: removed, created });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || err.message;
+    console.error("POST /vehicles/sync error:", data);
+    return res.status(status).json({ error: "server_error", details: data });
   }
 }
 
-// ========== ROUTES ==========
+// ---- route bindings ----
+app.get("/api/hubspot/vehicles", handleGetVehicles);
+app.post("/api/hubspot/vehicles/sync", handleSyncVehicles);
 
-// Simple health check
-app.get("/", (_req, res) => {
-  res.json({ ok: true, message: "HubSpot BFF is running" });
-});
+app.get("/vehicles", handleGetVehicles);
+app.post("/vehicles/sync", handleSyncVehicles);
 
-// Create or update a contact in HubSpot
-// POST /contacts
-// Body: { email, firstName, lastName, phone }
+
+// === NEW: Create/Upsert HubSpot Contact ================================
 app.post("/contacts", async (req, res) => {
   try {
-    const email = (req.body?.email || "").toString().trim();
+    const email = String(req.body?.email || "").trim();
     const firstName = req.body?.firstName?.toString() ?? "";
     const lastName  = req.body?.lastName?.toString() ?? "";
     const phone     = req.body?.phone?.toString() ?? "";
@@ -253,105 +337,9 @@ app.post("/contacts", async (req, res) => {
     return res.status(status).json({ success: false, message: "server_error", details });
   }
 });
-// === END new route ===================
+// === END new route =====================================================
 
-// ========== Vehicle routes ==========
-
-// GET /vehicles?email=...
-app.get("/vehicles", async (req, res) => {
-  try {
-    const email = (req.query.email || "").toString().trim();
-    if (!email) {
-      return res.status(400).json({ vehicles: [], debug: { message: "email is required" } });
-    }
-
-    const debug = { email, steps: [] };
-
-    // 1) Find contact by email
-    const contact = await getContactByEmail(email);
-    debug.steps.push({
-      step: "findContactByEmail",
-      found: !!contact,
-      contactId: contact?.id || null,
-      contactProps: contact?.properties || null,
-    });
-
-    if (!contact || !contact.id) {
-      return res.status(404).json({ vehicles: [], debug });
-    }
-
-    const contactId = contact.id;
-
-    // 2) Get associated note IDs
-    const noteIds = await getAssociatedNoteIds(contactId);
-    debug.steps.push({ step: "getNoteIdsForContact", count: noteIds.length, noteIds });
-
-    if (!noteIds.length) {
-      return res.json({ vehicles: [], debug });
-    }
-
-    // 3) Read notes and parse JSON vehicles
-    const notes = await getNotesByIds(noteIds);
-    debug.steps.push({
-      step: "parseNotes",
-      parsedPreview: notes.map(n => ({ id: n.id, length: n.body.length })).slice(0, 5),
-    });
-
-    let allVehicles = [];
-    notes.forEach(note => {
-      const vs = parseVehiclesFromNoteBody(note.body);
-      if (vs.length) {
-        allVehicles = allVehicles.concat(vs);
-      }
-    });
-
-    return res.json({ vehicles: allVehicles, debug });
-  } catch (err) {
-    console.error("GET /vehicles error:", err.response?.data || err.message);
-    return res.status(500).json({
-      vehicles: [],
-      debug: {
-        error: err.response?.data || err.message,
-      },
-    });
-  }
-});
-
-// POST /vehicles/sync
-// Body: { email, vehicles: [ ... ] }
-app.post("/vehicles/sync", async (req, res) => {
-  try {
-    const email = (req.body?.email || "").toString().trim();
-    const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles : [];
-    if (!email) {
-      return res.status(400).json({ success: false, message: "email is required" });
-    }
-
-    // 1) Find contact
-    const contact = await getContactByEmail(email);
-    if (!contact || !contact.id) {
-      return res.status(404).json({ success: false, message: "contact_not_found" });
-    }
-    const contactId = contact.id;
-
-    // 2) Find and delete existing vehicle notes
-    const noteIds = await getAssociatedNoteIds(contactId);
-    if (noteIds.length) {
-      await deleteNotesByIds(noteIds);
-    }
-
-    // 3) Create new note(s) with current vehicles JSON
-    const body = vehiclesToJsonNoteBody(vehicles);
-    await createNoteForContact(contactId, body);
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("POST /vehicles/sync error:", err.response?.data || err.message);
-    return res.status(500).json({ success: false, message: "server_error" });
-  }
-});
-
-// ==================== NEW ROUTE: contact status (jobtitle) ====================
+// === NEW: read contact job title by email ================================
 // GET /contacts/status?email=someone@example.com
 // Returns: { jobTitle: string|null }
 app.get("/contacts/status", async (req, res) => {
@@ -373,15 +361,23 @@ app.get("/contacts/status", async (req, res) => {
     return res.status(500).json({ jobTitle: null });
   }
 });
-// === END new route =============
+// === END new route =======================================================
 
-// ======================== STRIPE (ADDED/UPDATED) =============================
 
-// Helper to get or create a Stripe customer by email, optionally updating name
+
+// ========================== STRIPE (ADDED/UPDATED) ===============================
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
+
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
+  : null;
+
+// Helper: find or create Stripe Customer by email, and keep name in sync
 async function getOrCreateStripeCustomerByEmail(email, name) {
-  // Look for existing customer with the same email
+  if (!stripe) throw new Error("Stripe not configured");
   const existing = await stripe.customers.list({ email, limit: 1 });
-
   if (existing.data.length > 0) {
     const customer = existing.data[0];
     // Update name when provided (no-op if same/empty)
@@ -435,9 +431,6 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
       metadata: { hubspot_email: email, app_source: "ios_signup" },
     });
 
-    // Mark HubSpot contact as subscriber (jobtitle = "1") after Stripe payment intent is created
-    await markContactAsSubscriberByEmail(email);
-
     return res.json({
       email,
       customerId: customer.id,
@@ -470,7 +463,8 @@ app.post("/stripe/init-setup", async (req, res) => {
 
     const setupIntent = await stripe.setupIntents.create({
       customer: customer.id,
-      payment_method_types: ["card"],
+      usage: "off_session",
+      payment_method_types: ["card", "link"],
       metadata: { hubspot_email: email, app_source: "ios_setup" },
     });
 
