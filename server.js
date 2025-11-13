@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
-import Stripe from "stripe"; // â† added (kept)
+import Stripe from "stripe"; // ← added (kept)
 
 dotenv.config();
 
@@ -48,6 +48,26 @@ async function getContactByEmail(email) {
     limit: 1,
   });
   return resp.data?.results?.[0] || null;
+}
+
+async function markContactAsSubscriberByEmail(email) {
+  if (!email) return null;
+  try {
+    const contact = await getContactByEmail(email);
+    if (!contact || !contact.id) {
+      console.warn("markContactAsSubscriberByEmail: no contact found for email", email);
+      return null;
+    }
+    await hs.patch(`/crm/v3/objects/contacts/${contact.id}`, {
+      properties: {
+        jobtitle: "1",
+      },
+    });
+    return contact.id;
+  } catch (err) {
+    console.error("markContactAsSubscriberByEmail error:", err.response?.data || err.message || err);
+    return null;
+  }
 }
 
 // Prefer v3 associations; fall back to v4 if needed
@@ -103,28 +123,49 @@ async function deleteExistingNotes(contactId) {
 function normalize(obj) {
   if (!obj || typeof obj !== "object") return null;
   const keys = ["make", "model", "year", "color", "licensePlate", "plate", "name"];
-  const score = keys.reduce((acc, k) => acc + (obj[k] ? 1 : 0), 0);
-  if (score >= 2) {
-    return {
-      name: obj.name || `${obj.make || ""} ${obj.model || ""}`.trim(),
-      make: obj.make || "",
-      model: obj.model || "",
-      year: String(obj.year || ""),
-      color: obj.color || "",
-      licensePlate: obj.licensePlate || obj.plate || "",
-      plate: obj.plate || obj.licensePlate || "",
-    };
+  const result = {};
+
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      const val = obj[key];
+      if (val != null) {
+        result[key] = String(val);
+      }
+    }
   }
-  return null;
+
+  if (!result.name) {
+    const parts = [];
+    if (result.year) parts.push(result.year);
+    if (result.make) parts.push(result.make);
+    if (result.model) parts.push(result.model);
+    result.name = parts.join(" ").trim() || "Vehicle";
+  }
+
+  if (!result.plate && result.licensePlate) {
+    result.plate = result.licensePlate;
+  }
+
+  if (!result.plate) {
+    result.plate = "—";
+  }
+
+  if (!result.color) {
+    result.color = "—";
+  }
+
+  return result;
 }
 
-// returns an array of normalized vehicles (0..n) from a note body
 function extractVehiclesFromBody(body) {
-  const out = [];
-  if (!body || typeof body !== "string") return out;
+  if (!body || typeof body !== "string") return [];
 
-  const tryParseAny = (txt) => {
-    try { return JSON.parse(txt); } catch { return null; }
+  const tryParseAny = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
   };
 
   // 1) direct parse
@@ -141,26 +182,25 @@ function extractVehiclesFromBody(body) {
 
     if (hasArray && (!hasObject || firstBracket < firstBrace)) {
       parsed = tryParseAny(body.slice(firstBracket, lastBracket + 1));
-    }
-    if (!parsed && hasObject) {
+    } else if (hasObject) {
       parsed = tryParseAny(body.slice(firstBrace, lastBrace + 1));
     }
   }
 
-  // 3) normalize into an array
+  const out = [];
+
+  if (!parsed) return out;
+
   if (Array.isArray(parsed)) {
     for (const item of parsed) {
       const n = normalize(item);
       if (n) out.push(n);
     }
-    return out;
-  }
-
-  if (parsed && typeof parsed === "object") {
-    // wrapper like { vehicles: [...] }
+  } else {
+    // maybe {vehicles: [...]}
     if (Array.isArray(parsed.vehicles)) {
-      for (const item of parsed.vehicles) {
-        const n = normalize(item);
+      for (const v of parsed.vehicles) {
+        const n = normalize(v);
         if (n) out.push(n);
       }
       return out;
@@ -177,12 +217,16 @@ function extractVehiclesFromBody(body) {
 async function handleGetVehicles(req, res) {
   try {
     const email = String(req.query.email || "").trim();
-    const debug = String(req.query.debug || "") === "1";
-    if (!email) return res.status(400).json({ error: "email is required" });
+    const debug = req.query.debug === "true";
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
 
     const contact = await getContactByEmail(email);
-    if (!contact)
-      return res.status(200).json({ vehicles: [], debug: { reason: "no_contact" } });
+    if (!contact || !contact.id) {
+      return res.status(404).json({ error: "contact_not_found" });
+    }
 
     const noteIds = await getAssociatedNoteIds(contact.id);
     const notes = await getNotesByIds(noteIds);
@@ -200,15 +244,16 @@ async function handleGetVehicles(req, res) {
     const payload = { vehicles };
     if (debug)
       payload.debug = {
-        contactId: contact.id,
-        noteIds,
-        totalNotes: notes.length,
-        rawBodies: raw,
+        count: notes.length,
+        notes: raw,
       };
-    return res.status(200).json(payload);
+
+    return res.json(payload);
   } catch (err) {
-    console.error("GET /vehicles error:", err.response?.data || err.message);
-    return res.status(err.response?.status || 500).json({ error: "server_error" });
+    const status = err.response?.status || 500;
+    const data = err.response?.data || err.message;
+    console.error("GET /vehicles error:", data);
+    return res.status(status).json({ error: "server_error", details: data });
   }
 }
 
@@ -337,9 +382,8 @@ app.post("/contacts", async (req, res) => {
     return res.status(status).json({ success: false, message: "server_error", details });
   }
 });
-// === END new route =====================================================
 
-// === NEW: read contact job title by email ================================
+// ==================== CONTACT STATUS (jobtitle) ====================
 // GET /contacts/status?email=someone@example.com
 // Returns: { jobTitle: string|null }
 app.get("/contacts/status", async (req, res) => {
@@ -361,11 +405,10 @@ app.get("/contacts/status", async (req, res) => {
     return res.status(500).json({ jobTitle: null });
   }
 });
-// === END new route =======================================================
-
-
 
 // ========================== STRIPE (ADDED/UPDATED) ===============================
+
+const PORTAL_RETURN_URL = process.env.PORTAL_RETURN_URL || "https://gasmeuppgh.com";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
@@ -386,7 +429,7 @@ async function getOrCreateStripeCustomerByEmail(email, name) {
     }
     return customer;
   }
-  // Create with name + email
+  // No customer found, create a new one
   return await stripe.customers.create({
     email,
     name: name || undefined,
@@ -400,6 +443,33 @@ app.get("/stripe/publishable-key", (_req, res) => {
     return res.status(500).json({ error: "Missing STRIPE_PUBLISHABLE_KEY" });
   }
   return res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
+});
+
+// Create a Stripe Billing Portal session for managing payment methods
+app.post("/stripe/create-portal-session", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = (req.body?.email ?? "").toString().trim();
+    const name  = (req.body?.name  ?? "").toString().trim();
+    if (!email) {
+      return res.status(400).json({ error: { message: "email required" } });
+    }
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: PORTAL_RETURN_URL,
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("create-portal-session error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "portal_error" } });
+  }
 });
 
 // One-off charge via PaymentIntent (kept). Now REQUIRES real email; accepts optional name.
@@ -431,6 +501,9 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
       metadata: { hubspot_email: email, app_source: "ios_signup" },
     });
 
+    // Mark HubSpot contact as subscriber (jobtitle = "1") after payment intent creation
+    await markContactAsSubscriberByEmail(email);
+
     return res.json({
       email,
       customerId: customer.id,
@@ -443,7 +516,7 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
   }
 });
 
-// SetupIntent flow to save card first (optional) â€” now REQUIRES real email; accepts name
+// SetupIntent flow to save card first (optional) — now REQUIRES real email; accepts name
 app.post("/stripe/init-setup", async (req, res) => {
   try {
     if (!stripe) {
