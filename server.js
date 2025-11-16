@@ -626,6 +626,63 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
   }
 });
 
+
+app.post("/stripe/init-refill-payment", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = (req.body?.email ?? "").toString().trim();
+    const name = (req.body?.name ?? "").toString().trim();
+    if (!email) {
+      return res.status(400).json({ error: { message: "email required" } });
+    }
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2023-10-16" }
+    );
+
+    const amountCents = Number.isFinite(req.body?.amountCents)
+      ? req.body.amountCents
+      : 1500; // default $15
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: "usd",
+      customer: customer.id,
+      automatic_payment_methods: { enabled: true },
+      setup_future_usage: "off_session",
+      metadata: {
+        hubspot_email: email,
+        app_source: "ios_refill",
+      },
+    });
+
+    return res.json({
+      email,
+      customerId: customer.id,
+      ephemeralKeySecret: ephemeralKey.secret,
+      paymentIntentClientSecret: paymentIntent.client_secret,
+    });
+  } catch (err) {
+    console.error(
+      "init-refill-payment error:",
+      err?.response?.data || err?.message || err
+    );
+    return res
+      .status(500)
+      .json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
+
+
+
 // SetupIntent flow to save card first (optional)
 app.post("/stripe/init-setup", async (req, res) => {
   try {
