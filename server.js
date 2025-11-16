@@ -427,6 +427,84 @@ app.get("/contacts/status", async (req, res) => {
   }
 });
 
+// ========================== REFILL BOOKING / TASK CREATION ===============================
+
+/**
+ * POST /refills/book
+ * Body: { email, serviceLocation, scheduledAt, vehicle: { name, plate, color } }
+ * Creates a HubSpot CRM task associated to the contact representing this refill request.
+ */
+app.post("/refills/book", async (req, res) => {
+  try {
+    const email = (req.body?.email ?? "").toString().trim();
+    const serviceLocation = (req.body?.serviceLocation ?? "").toString().trim();
+    const scheduledAt = (req.body?.scheduledAt ?? "").toString().trim();
+    const vehicle = req.body?.vehicle || {};
+
+    if (!email || !serviceLocation || !scheduledAt) {
+      return res
+        .status(400)
+        .json({ error: "email, serviceLocation, and scheduledAt are required" });
+    }
+
+    const contact = await getContactByEmail(email);
+    if (!contact || !contact.id) {
+      return res.status(404).json({ error: "contact_not_found" });
+    }
+
+    const vehicleName = (vehicle.name ?? "").toString().trim();
+    const vehiclePlate = (vehicle.plate ?? "").toString().trim();
+    const vehicleColor = (vehicle.color ?? "").toString().trim();
+
+    const subject =
+      vehicleName || vehiclePlate
+        ? `Refill request - ${vehicleName || vehiclePlate}`
+        : "Refill request";
+
+    const bodyLines = [
+      "New refill request from iOS app.",
+      "",
+      `Service location: ${serviceLocation}`,
+      `Scheduled for: ${scheduledAt}`,
+      "",
+      `Vehicle: ${vehicleName || "N/A"}`,
+      `Plate: ${vehiclePlate || "N/A"}`,
+      `Color: ${vehicleColor || "N/A"}`,
+    ];
+    const taskBody = bodyLines.join("\n");
+
+    const taskResp = await hs.post("/crm/v3/objects/tasks", {
+      properties: {
+        hs_timestamp: scheduledAt, // ISO8601 is accepted
+        hs_task_subject: subject,
+        hs_task_body: taskBody,
+        hs_task_status: "NOT_STARTED",
+        hs_task_priority: "HIGH",
+        hs_task_type: "TODO",
+      },
+      associations: [
+        {
+          to: { id: contact.id },
+          types: [
+            {
+              associationCategory: "HUBSPOT_DEFINED",
+              associationTypeId: "task_to_contact",
+            },
+          ],
+        },
+      ],
+    });
+
+    const taskId = taskResp.data?.id;
+    return res.status(201).json({ ok: true, taskId });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const details = err.response?.data || err.message;
+    console.error("POST /refills/book error:", details);
+    return res.status(status).json({ error: "server_error", details });
+  }
+});
+
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
 
 const PORTAL_RETURN_URL = process.env.PORTAL_RETURN_URL || "https://gasmeuppgh.com";
