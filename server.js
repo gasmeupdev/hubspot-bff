@@ -442,9 +442,9 @@ app.post("/refills/book", async (req, res) => {
     const vehicle = req.body?.vehicle || {};
 
     if (!email || !serviceLocation || !scheduledAt) {
-      return res
-        .status(400)
-        .json({ error: "email, serviceLocation, and scheduledAt are required" });
+      return res.status(400).json({
+        error: "email, serviceLocation, and scheduledAt are required",
+      });
     }
 
     const contact = await getContactByEmail(email);
@@ -473,29 +473,28 @@ app.post("/refills/book", async (req, res) => {
     ];
     const taskBody = bodyLines.join("\n");
 
+    // 1) Create the task (no associations here – avoids the "int value" error)
     const taskResp = await hs.post("/crm/v3/objects/tasks", {
       properties: {
-        hs_timestamp: scheduledAt, // ISO8601 is accepted
+        hs_timestamp: scheduledAt, // ISO8601 string is fine
         hs_task_subject: subject,
         hs_task_body: taskBody,
         hs_task_status: "NOT_STARTED",
         hs_task_priority: "HIGH",
         hs_task_type: "TODO",
       },
-      associations: [
-        {
-          to: { id: contact.id },
-          types: [
-            {
-              associationCategory: "HUBSPOT_DEFINED",
-              associationTypeId: "task_to_contact",
-            },
-          ],
-        },
-      ],
     });
 
     const taskId = taskResp.data?.id;
+    if (!taskId) {
+      return res.status(500).json({ error: "task_creation_failed" });
+    }
+
+    // 2) Associate task → contact (v3 association endpoint)
+    await hs.put(
+      `/crm/v3/objects/tasks/${taskId}/associations/contacts/${contact.id}/task_to_contact`
+    );
+
     return res.status(201).json({ ok: true, taskId });
   } catch (err) {
     const status = err.response?.status || 500;
@@ -504,6 +503,7 @@ app.post("/refills/book", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
 
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
 
