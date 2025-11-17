@@ -303,18 +303,20 @@ async function handleSyncVehicles(req, res) {
     // STEP 2: create new notes — ONE note per vehicle
     let created = 0;
     for (const v of vehicles) {
-      const payload = JSON.stringify({
-        name: v.name || `${v.make || ""} ${v.model || ""}`.trim(),
-        make: v.make || "",
-        model: v.model || "",
-        year: v.year || "",
-        color: v.color || "",
-        licensePlate: v.licensePlate || v.plate || "",
-      });
-      const noteId = await createNote(payload);
-      await associateNoteToContact(noteId, contact.id);
-      created++;
-    }
+  const payload = JSON.stringify({
+    name: v.name || `${v.make || ""} ${v.model || ""}`.trim(),
+    make: v.make || "",
+    model: v.model || "",
+    year: v.year || "",
+    color: v.color || "",
+    // Store last 3 digits of license plate
+    licensePlate: v.plate || v.licensePlate || ""
+  });
+
+  const noteId = await createNote(payload);
+  await associateNoteToContact(noteId, contact.id);
+}
+
 
     return res.status(200).json({ ok: true, deleted: removed, created });
   } catch (err) {
