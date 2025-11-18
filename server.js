@@ -490,12 +490,17 @@ app.get("/contacts/status", async (req, res) => {
 });
 
 // GET /refills/history?email=someone@example.com
-// Returns refill-related tasks for this contact, including a parsed status code
-// from the task subject. Status codes are:
-// (0) → in_progress (feint yellow)
-// (1) → completed (feint green)
-// (2) → canceled (feint red)
-// If there is no leading code, it is treated as (0).
+// Returns an array of refill-related tasks for this contact.
+// Each element looks like:
+// {
+//   id: string,
+//   subject: string,      // cleaned (no "(0)" / "(1)" / "(2)")
+//   rawSubject: string,   // original HubSpot subject
+//   body: string,
+//   timestamp: string,    // ISO date string
+//   statusCode: number,   // 0 | 1 | 2
+//   status: string        // "in_progress" | "completed" | "canceled"
+// }
 app.get("/refills/history", async (req, res) => {
   try {
     const email = String(req.query.email || "").trim();
@@ -524,7 +529,8 @@ app.get("/refills/history", async (req, res) => {
     // Load associated tasks
     const taskIds = await getAssociatedTaskIds(contactId);
     if (!taskIds.length) {
-      return res.json({ tasks: [] });
+      // IMPORTANT: return an *array* (Swift expects [RefillTask])
+      return res.json([]);
     }
 
     const tasksRaw = await getTasksByIds(taskIds);
@@ -552,8 +558,8 @@ app.get("/refills/history", async (req, res) => {
           rawSubject: subjectRaw,
           body,
           timestamp,
-          statusCode: code, // "0" | "1" | "2"
-          status,          // "in_progress" | "completed" | "canceled"
+          statusCode: code, // INT: 0 | 1 | 2
+          status,           // "in_progress" | "completed" | "canceled"
         };
       })
       .filter(Boolean)
@@ -565,7 +571,8 @@ app.get("/refills/history", async (req, res) => {
         return 0;
       });
 
-    return res.json({ tasks });
+    // IMPORTANT: return the array, NOT { tasks: [...] }
+    return res.json(tasks);
   } catch (err) {
     const status = err.response?.status || 500;
     const details = err.response?.data || err.message;
@@ -573,6 +580,7 @@ app.get("/refills/history", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
 
 // ========================== REFILL BOOKING / TASK CREATION ===============================
 
