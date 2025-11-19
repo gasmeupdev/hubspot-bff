@@ -149,6 +149,9 @@ async function createNote(body) {
   const resp = await hs.post("/crm/v3/objects/notes", {
     properties: {
       hs_note_body: textBody,
+            hs_timestamp: new Date().toISOString(), // or Date.now() if you prefer epoch ms
+
+      
     },
   });
   return resp.data;
