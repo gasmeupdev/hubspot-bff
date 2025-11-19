@@ -108,7 +108,8 @@ app.get("/vehicles", async (req, res) => {
     );
 
     const noteIds =
-      assocResp.data?.results?.map((r) => r.to?.id).filter(Boolean) || [];
+  assocResp.data?.results?.map((r) => r.id).filter(Boolean) || [];
+
 
     if (noteIds.length === 0) {
       return res.json({ email, contactId, vehicles: [] });
@@ -211,8 +212,9 @@ app.post("/vehicles/sync", async (req, res) => {
     const assocResp = await hs.get(
       `/crm/v3/objects/contacts/${contactId}/associations/notes`
     );
-    const existingNoteIds =
-      assocResp.data?.results?.map((r) => r.to?.id).filter(Boolean) || [];
+   const existingNoteIds =
+  assocResp.data?.results?.map((r) => r.id).filter(Boolean) || [];
+
 
     for (const noteId of existingNoteIds) {
       try {
