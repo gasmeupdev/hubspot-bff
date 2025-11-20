@@ -448,8 +448,8 @@ app.post("/refills/book", async (req, res) => {
 });
 
 // GET /refills/history?email=...
-// Returns refill-related HubSpot tasks for the contact, based on the
-// naming convention where the task subject starts with "(0)", "(1)", or "(2)".
+// Returns refill-related HubSpot tasks for the contact in the shape
+// expected by the iOS app: { refills: [ { id, subject, statusCode, statusLabel, timestamp } ] }
 app.get("/refills/history", async (req, res) => {
   try {
     const email = (req.query?.email ?? "").toString().trim();
@@ -484,6 +484,7 @@ app.get("/refills/history", async (req, res) => {
       const props = task.properties || {};
       const subject = (props.hs_task_subject || "").toString().trim();
 
+      // Must be associated to this contact
       const assocContacts =
         task.associations?.contacts?.results ||
         task.associations?.contacts ||
@@ -494,34 +495,79 @@ app.get("/refills/history", async (req, res) => {
 
       if (!isAssociated) return false;
 
-      return (
+      // Decide if this is a "refill" task:
+      //  - subject starts with "(0)", "(1)", or "(2)", OR
+      //  - subject contains "refill" (covers tasks created by /refills/book)
+      const lower = subject.toLowerCase();
+      const hasPrefix =
         subject.startsWith("(0)") ||
         subject.startsWith("(1)") ||
-        subject.startsWith("(2)")
-      );
+        subject.startsWith("(2)");
+      const containsRefill = lower.includes("refill");
+
+      return hasPrefix || containsRefill;
     });
 
     const mapped = refillTasks.map((task) => {
       const props = task.properties || {};
+      const rawSubject = (props.hs_task_subject || "").toString();
+
+      let subject = rawSubject;
+      let statusCode = 0;
+
+      // Try to parse a leading "(0)", "(1)", "(2)" prefix
+      const match = rawSubject.match(/^\((\d)\)\s*(.*)$/);
+      if (match) {
+        statusCode = parseInt(match[1], 10) || 0;
+        subject = match[2] || "";
+      } else {
+        // No explicit code prefix => default (0) "in progress",
+        // but we can also look at HubSpot's hs_task_status as a secondary signal
+        const hsStatus = (props.hs_task_status || "").toString().toUpperCase();
+        if (hsStatus === "COMPLETED") {
+          statusCode = 1;
+        } else if (hsStatus === "CANCELED" || hsStatus === "DEFERRED") {
+          statusCode = 2;
+        } else {
+          statusCode = 0; // in progress / not started
+        }
+      }
+
+      let statusLabel;
+      switch (statusCode) {
+        case 1:
+          statusLabel = "Completed";
+          break;
+        case 2:
+          statusLabel = "Canceled";
+          break;
+        case 0:
+        default:
+          statusLabel = "In progress";
+          break;
+      }
+
       return {
         id: task.id,
-        subject: (props.hs_task_subject || "").toString(),
-        body: (props.hs_task_body || "").toString(),
+        subject,
         timestamp: props.hs_timestamp || task.createdAt || null,
-        status: props.hs_task_status || "",
+        statusCode,
+        statusLabel,
       };
     });
 
+    // Newest first
     mapped.sort((a, b) => {
       const aTime = a.timestamp ? Date.parse(a.timestamp) : 0;
       const bTime = b.timestamp ? Date.parse(b.timestamp) : 0;
       return bTime - aTime;
     });
 
+    // 👉 Shape matches what the Swift code expects
     return res.json({
       email,
-      contactId,
-      tasks: mapped,
+      contactId: String(contact.id),
+      refills: mapped,
     });
   } catch (err) {
     const status = err.response?.status || 500;
@@ -530,6 +576,7 @@ app.get("/refills/history", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
 
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
 
