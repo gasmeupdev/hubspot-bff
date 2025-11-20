@@ -484,7 +484,7 @@ app.get("/refills/history", async (req, res) => {
       const props = task.properties || {};
       const subject = (props.hs_task_subject || "").toString().trim();
 
-      // Must be associated to this contact
+      // Must be associated with this contact
       const assocContacts =
         task.associations?.contacts?.results ||
         task.associations?.contacts ||
@@ -495,9 +495,9 @@ app.get("/refills/history", async (req, res) => {
 
       if (!isAssociated) return false;
 
-      // Decide if this is a "refill" task:
-      //  - subject starts with "(0)", "(1)", or "(2)", OR
-      //  - subject contains "refill" (covers tasks created by /refills/book)
+      // Consider this a "refill" task if:
+      // - Subject starts with (0), (1), (2), OR
+      // - It contains the word "refill"
       const lower = subject.toLowerCase();
       const hasPrefix =
         subject.startsWith("(0)") ||
@@ -515,21 +515,20 @@ app.get("/refills/history", async (req, res) => {
       let subject = rawSubject;
       let statusCode = 0;
 
-      // Try to parse a leading "(0)", "(1)", "(2)" prefix
+      // Parse leading "(0)", "(1)", "(2)" if present
       const match = rawSubject.match(/^\((\d)\)\s*(.*)$/);
       if (match) {
         statusCode = parseInt(match[1], 10) || 0;
         subject = match[2] || "";
       } else {
-        // No explicit code prefix => default (0) "in progress",
-        // but we can also look at HubSpot's hs_task_status as a secondary signal
+        // Fallback to HubSpot status
         const hsStatus = (props.hs_task_status || "").toString().toUpperCase();
         if (hsStatus === "COMPLETED") {
           statusCode = 1;
         } else if (hsStatus === "CANCELED" || hsStatus === "DEFERRED") {
           statusCode = 2;
         } else {
-          statusCode = 0; // in progress / not started
+          statusCode = 0;
         }
       }
 
@@ -553,6 +552,7 @@ app.get("/refills/history", async (req, res) => {
         timestamp: props.hs_timestamp || task.createdAt || null,
         statusCode,
         statusLabel,
+        details: (props.hs_task_body || "").toString(),
       };
     });
 
@@ -563,10 +563,9 @@ app.get("/refills/history", async (req, res) => {
       return bTime - aTime;
     });
 
-    // 👉 Shape matches what the Swift code expects
     return res.json({
       email,
-      contactId: String(contact.id),
+      contactId,
       refills: mapped,
     });
   } catch (err) {
@@ -576,6 +575,7 @@ app.get("/refills/history", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
 
 
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
