@@ -577,6 +577,51 @@ app.get("/refills/history", async (req, res) => {
 });
 
 
+app.post("/refills/update", async (req, res) => {
+  try {
+    const { taskId, subject, body } = req.body || {};
+
+    if (!taskId) {
+      return res.status(400).json({ error: "taskId is required" });
+    }
+
+    const properties = {};
+    if (typeof subject === "string") {
+      properties.hs_task_subject = subject;
+    }
+    if (typeof body === "string") {
+      properties.hs_task_body = body;
+    }
+
+    if (Object.keys(properties).length === 0) {
+      return res.status(400).json({ error: "no_updatable_fields" });
+    }
+
+    const resp = await hs.patch(`/crm/v3/objects/tasks/${taskId}`, {
+      properties,
+    });
+
+    const props = resp.data?.properties || {};
+
+    const updatedTask = {
+      id: resp.data.id,
+      subject: (props.hs_task_subject || "").toString(),
+      timestamp: props.hs_timestamp || resp.data.createdAt || null,
+    };
+
+    return res.json({
+      success: true,
+      task: updatedTask,
+    });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const details = err.response?.data || err.message;
+    console.error("POST /refills/update error:", details);
+    return res.status(status).json({ error: "server_error", details });
+  }
+});
+
+
 
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
 
