@@ -604,7 +604,7 @@ app.post("/refills/update", async (req, res) => {
 
     if (isCancel) {
       // This makes HubSpot’s own status reflect cancellation.
-      properties.hs_task_status = "CANCELED";
+      properties.hs_task_status = "DEFERRED";
     }
 
     if (Object.keys(properties).length === 0) {
