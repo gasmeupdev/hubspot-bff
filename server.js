@@ -579,18 +579,32 @@ app.get("/refills/history", async (req, res) => {
 
 app.post("/refills/update", async (req, res) => {
   try {
-    const { taskId, subject, body } = req.body || {};
+    const { taskId, subject, body, cancel } = req.body || {};
 
     if (!taskId) {
       return res.status(400).json({ error: "taskId is required" });
     }
 
     const properties = {};
+
     if (typeof subject === "string") {
       properties.hs_task_subject = subject;
     }
+
     if (typeof body === "string") {
       properties.hs_task_body = body;
+    }
+
+    // If this is a cancel action, mark the HubSpot task as canceled.
+    const isCancel =
+      cancel === true ||
+      cancel === "true" ||
+      cancel === 1 ||
+      cancel === "1";
+
+    if (isCancel) {
+      // This makes HubSpot’s own status reflect cancellation.
+      properties.hs_task_status = "CANCELED";
     }
 
     if (Object.keys(properties).length === 0) {
@@ -607,6 +621,7 @@ app.post("/refills/update", async (req, res) => {
       id: resp.data.id,
       subject: (props.hs_task_subject || "").toString(),
       timestamp: props.hs_timestamp || resp.data.createdAt || null,
+      status: (props.hs_task_status || "").toString(),
     };
 
     return res.json({
@@ -620,6 +635,7 @@ app.post("/refills/update", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
 
 
 
