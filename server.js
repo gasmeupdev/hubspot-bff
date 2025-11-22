@@ -11,6 +11,14 @@ const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
+// === Truck live location in-memory store ===
+let truckLocation = null;
+
+// Optional: simple secret key so only Phone A can update
+// Set this in your environment variables on the server (and in the app) later.
+const TRUCK_LOCATION_SECRET = process.env.TRUCK_LOCATION_SECRET || 'dev-truck-secret';
+
+
 if (!HUBSPOT_TOKEN) {
   console.error("Missing HUBSPOT_TOKEN");
   process.exit(1);
@@ -575,6 +583,51 @@ app.get("/refills/history", async (req, res) => {
     return res.status(status).json({ error: "server_error", details });
   }
 });
+
+
+// GET /truck/location
+// Returns { lat, lng, heading, speed, updatedAt } or 404 if unknown
+app.get('/truck/location', (req, res) => {
+  if (!truckLocation) {
+    return res.status(404).json({ error: 'Truck location not available' });
+  }
+
+  return res.json(truckLocation);
+});
+
+
+// POST /truck/location
+// Body: { lat: number, lng: number, heading?: number, speed?: number }
+// Header: x-truck-secret: <TRUCK_LOCATION_SECRET>
+app.post('/truck/location', (req, res) => {
+  try {
+    const secret = req.headers['x-truck-secret'];
+    if (!secret || secret !== TRUCK_LOCATION_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { lat, lng, heading, speed } = req.body || {};
+
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ error: 'lat and lng must be numbers' });
+    }
+
+    truckLocation = {
+      lat,
+      lng,
+      heading: typeof heading === 'number' ? heading : null,
+      speed: typeof speed === 'number' ? speed : null,
+      updatedAt: new Date().toISOString()
+    };
+
+    return res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('Error updating truck location:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
 
 
 app.post("/refills/update", async (req, res) => {
