@@ -10,7 +10,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // === Truck live location in-memory store ===
 let truckLocation = null;
