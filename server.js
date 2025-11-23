@@ -181,6 +181,31 @@ async function createNote(body) {
   return resp.data;
 }
 
+
+async function markContactAsSubscriberByEmail(email) {
+  if (!email) return null;
+  try {
+    const contact = await getContactByEmail(email);
+    if (!contact || !contact.id) {
+      console.warn("markContactAsSubscriberByEmail: no contact found for email", email);
+      return null;
+    }
+
+    const contactId = contact.id;
+    await hs.patch(`/crm/v3/objects/contacts/${contactId}`, {
+      properties: {
+        jobtitle: "1",
+      },
+    });
+
+    return contact.id;
+  } catch (err) {
+    console.error("markContactAsSubscriberByEmail error:", err.response?.data || err.message || err);
+    return null;
+  }
+}
+
+
 // Associate note -> contact
 async function associateNoteToContact(noteId, contactId) {
   await hs.put(
