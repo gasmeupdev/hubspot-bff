@@ -709,8 +709,7 @@ app.post("/refills/update", async (req, res) => {
 
 // ========================== STRIPE (BILLING & PAYMENTS) ===============================
 
-const PORTAL_RETURN_URL =
-  process.env.PORTAL_RETURN_URL || "https://gasmeuppgh.com";
+const PORTAL_RETURN_URL = process.env.PORTAL_RETURN_URL || "https://gasmeuppgh.com";
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
@@ -719,40 +718,50 @@ const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
   : null;
 
+// Helper: find or create Stripe Customer by email, and keep name in sync
 async function getOrCreateStripeCustomerByEmail(email, name) {
   if (!stripe) throw new Error("Stripe not configured");
 
   const existing = await stripe.customers.list({ email, limit: 1 });
   if (existing.data.length > 0) {
     const customer = existing.data[0];
+    // Update name when provided
     if (name && name !== customer.name) {
       await stripe.customers.update(customer.id, { name });
     }
     return customer;
   }
 
+  // No customer found, create a new one
   return await stripe.customers.create({
     email,
-    name,
+    name: name || undefined,
+    metadata: {
+      hubspot_email: email,
+    },
   });
 }
 
-// (Stripe endpoints unchanged from your existing file)
-// ... all your Stripe setup-intent / payment / portal routes here ...
+app.get("/stripe/publishable-key", (_req, res) => {
+  if (!STRIPE_PUBLISHABLE_KEY) {
+    return res.status(500).json({ error: "Missing STRIPE_PUBLISHABLE_KEY" });
+  }
+  return res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
+});
 
-// (Iâ€™m preserving the rest exactly as in your original server-21.js)
-
+// Create a Stripe Billing Portal session for managing payment methods
 app.post("/stripe/create-portal-session", async (req, res) => {
   try {
     if (!stripe) {
-      return res.status(500).json({ error: "stripe_not_configured" });
+      return res
+        .status(500)
+        .json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
     }
 
-    const email = (req.body.email ?? "").toString().trim();
-    const name = (req.body.name ?? "").toString().trim();
-
+    const email = (req.body?.email ?? "").toString().trim();
+    const name = (req.body?.name ?? "").toString().trim();
     if (!email) {
-      return res.status(400).json({ error: "email is required" });
+      return res.status(400).json({ error: { message: "email required" } });
     }
 
     const customer = await getOrCreateStripeCustomerByEmail(email, name);
@@ -762,19 +771,101 @@ app.post("/stripe/create-portal-session", async (req, res) => {
       return_url: PORTAL_RETURN_URL,
     });
 
-    return res.json({
-      url: session.url,
-    });
+    return res.json({ url: session.url });
   } catch (err) {
-    console.error(
-      "Error creating billing portal session:",
-      err?.response?.data || err?.message || err
-    );
-    return res.status(500).json({ error: "stripe_error" });
+    console.error("create-portal-session error:", err?.response?.data || err?.message || err);
+    return res
+      .status(500)
+      .json({ error: { message: err?.message || "portal_error" } });
   }
 });
 
-// (â€¦ keep all your other Stripe routes exactly as they were â€¦)
+// One-off charge via PaymentIntent. Used by "Become Subscriber" flow.
+app.post("/stripe/init-subscription-payment", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = (req.body?.email ?? "").toString().trim();
+    const name = (req.body?.name ?? "").toString().trim();
+    if (!email) return res.status(400).json({ error: { message: "email required" } });
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2023-10-16" }
+    );
+
+    const amountCents = Number.isFinite(req.body?.amountCents)
+      ? req.body.amountCents
+      : 2500; // default $25
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: "usd",
+      customer: customer.id,
+      automatic_payment_methods: { enabled: true },
+      setup_future_usage: "off_session",
+      metadata: { hubspot_email: email, app_source: "ios_signup" },
+    });
+
+    // Mark HubSpot contact as subscriber (jobtitle = "1") after payment intent creation
+    await markContactAsSubscriberByEmail(email);
+
+    return res.json({
+      email,
+      customerId: customer.id,
+      ephemeralKeySecret: ephemeralKey.secret,
+      paymentIntentClientSecret: paymentIntent.client_secret,
+    });
+  } catch (err) {
+    console.error("init-subscription-payment error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
+
+// SetupIntent flow to save card first (optional)
+app.post("/stripe/init-setup", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: { message: "Stripe not configured (missing STRIPE_SECRET_KEY)" } });
+    }
+
+    const email = (req.body?.email ?? "").toString().trim();
+    const name = (req.body?.name ?? "").toString().trim();
+    if (!email) return res.status(400).json({ error: { message: "email required" } });
+
+    const customer = await getOrCreateStripeCustomerByEmail(email, name);
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2023-10-16" }
+    );
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customer.id,
+      usage: "off_session",
+      payment_method_types: ["card", "link"],
+      metadata: { hubspot_email: email, app_source: "ios_setup" },
+    });
+
+    return res.json({
+      email,
+      customerId: customer.id,
+      ephemeralKeySecret: ephemeralKey.secret,
+      setupIntentClientSecret: setupIntent.client_secret,
+    });
+  } catch (err) {
+    console.error("init-setup error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: { message: err?.message || "stripe_error" } });
+  }
+});
 
 // JSON 404
 app.use((req, res) =>
