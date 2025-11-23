@@ -10,6 +10,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // === Truck live location in-memory store ===
 let truckLocation = null;
@@ -95,6 +96,21 @@ function parseVehiclesFromNotes(notes) {
 
   return vehicles;
 }
+
+
+
+// get stripe pk
+app.get('/stripe/publishable-key', (req, res) => {
+  const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
+
+  if (!publishableKey) {
+    return res.status(500).json({ error: 'Publishable key not found' });
+  }
+
+  res.json({ publishableKey });
+});
+
+
 
 // GET /vehicles?email=...
 app.get("/vehicles", async (req, res) => {
