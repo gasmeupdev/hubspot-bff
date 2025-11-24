@@ -909,6 +909,72 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
 
 //hubspot get gas prices
 
+app.get("/gas-prices", async (req, res) => {
+  try {
+    // Grab up to 50 tickets with subject + description/body
+    const searchRequest = {
+      filterGroups: [], // you can tighten this later to a specific pipeline if you want
+      properties: ["subject", "description", "hs_ticket_body", "content"],
+      limit: 50,
+    };
+
+    const resp = await hs.post(
+      "/crm/v3/objects/tickets/search",
+      searchRequest
+    );
+
+    const prices = {
+      regular: null,
+      mid: null,
+      premium: null,
+    };
+
+    for (const ticket of resp.data.results || []) {
+      const props = ticket.properties || {};
+      const subject = (props.subject || "").trim().toLowerCase();
+      const desc =
+        props.description ||
+        props.hs_ticket_body ||
+        props.content ||
+        "";
+
+      if (!desc) continue;
+
+      // Your convention:
+      // ticket "name" (subject) indicates grade:
+      // r = regular, m = mid, p = premium
+      // be generous in matching so it "just works"
+      const firstChar = subject.first || subject.prefix?.(1); // ignore in JS, just illustration
+
+      const startsWithR = subject.startsWith("r ");
+      const startsWithM = subject.startsWith("m ");
+      const startsWithP = subject.startsWith("p ");
+      const hasRegular = subject.includes("regular");
+      const hasMid = subject.includes("mid");
+      const hasPremium = subject.includes("premium");
+
+      if (!prices.regular && (startsWithR || hasRegular || subject === "r")) {
+        prices.regular = desc;
+      } else if (!prices.mid && (startsWithM || hasMid || subject === "m")) {
+        prices.mid = desc;
+      } else if (
+        !prices.premium &&
+        (startsWithP || hasPremium || subject === "p")
+      ) {
+        prices.premium = desc;
+      }
+    }
+
+    console.log("Gas prices payload:", prices);
+    return res.json(prices);
+  } catch (err) {
+    const details = err.response?.data || err.message || err;
+    console.error("Error loading gas prices:", details);
+    return res.status(500).json({ error: "Failed to load gas prices" });
+  }
+});
+
+
 
 // SetupIntent flow to save card first (optional)
 app.post("/stripe/init-setup", async (req, res) => {
