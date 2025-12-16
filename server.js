@@ -62,6 +62,7 @@ app.post("/push/register", (req, res) => {
   const set = deviceTokensByEmail.get(email) ?? new Set();
   set.add(fcmToken);
   deviceTokensByEmail.set(email, set);
+console.log("REGISTER PUSH TOKEN", { email, tokenCount: set.size });
 
   return res.json({ ok: true, email, tokenCount: set.size });
 });
