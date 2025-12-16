@@ -3,8 +3,27 @@ import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
 import Stripe from "stripe";
+import admin from "firebase-admin";
+
 
 dotenv.config();
+
+// ========================== FIREBASE ADMIN (FCM PUSH) ===============================
+const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
+  console.warn("Missing FIREBASE_SERVICE_ACCOUNT_JSON (push disabled).");
+} else {
+  const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log("Firebase Admin initialized");
+}
+
+// In-memory tokens (OK for testing). Replace with DB later.
+const deviceTokensByEmail = new Map(); // emailLower -> Set(tokens)
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,6 +51,43 @@ app.use(
   })
 );
 app.use(express.json());
+
+// POST /push/register  { email, fcmToken }
+app.post("/push/register", (req, res) => {
+  const email = (req.body?.email ?? "").toString().trim().toLowerCase();
+  const fcmToken = (req.body?.fcmToken ?? "").toString().trim();
+
+  if (!email || !fcmToken) return res.status(400).json({ error: "email and fcmToken required" });
+
+  const set = deviceTokensByEmail.get(email) ?? new Set();
+  set.add(fcmToken);
+  deviceTokensByEmail.set(email, set);
+
+  return res.json({ ok: true, email, tokenCount: set.size });
+});
+
+// POST /push/test  { email, title?, body? }
+app.post("/push/test", async (req, res) => {
+  if (!admin.apps.length) return res.status(500).json({ error: "firebase_admin_not_initialized" });
+
+  const email = (req.body?.email ?? "").toString().trim().toLowerCase();
+  const title = (req.body?.title ?? "Gas Me Up").toString();
+  const body = (req.body?.body ?? "Test push").toString();
+
+  const set = deviceTokensByEmail.get(email);
+  if (!set || set.size === 0) return res.status(404).json({ error: "no_tokens_for_email" });
+
+  const tokens = Array.from(set);
+  const resp = await admin.messaging().sendEachForMulticast({
+    tokens,
+    notification: { title, body },
+    data: { type: "test" },
+  });
+
+  return res.json({ ok: true, successCount: resp.successCount, failureCount: resp.failureCount });
+});
+
+
 
 // HubSpot axios instance
 const hs = axios.create({
@@ -314,6 +370,62 @@ app.post("/vehicles/sync", async (req, res) => {
     return res.status(status).json({ error: "server_error", details: data });
   }
 });
+
+
+// HubSpot webhook endpoint (configure URL in HubSpot):
+// https://hubspot-bff.onrender.com/hubspot/webhook
+app.post("/hubspot/webhook", async (req, res) => {
+  // Return 200 fast to avoid retries
+  res.status(200).json({ ok: true });
+
+  try {
+    if (!admin.apps.length) return;
+
+    const events = Array.isArray(req.body) ? req.body : [];
+    for (const ev of events) {
+      // We will refine this once you paste one sample webhook payload
+      const objectId = ev.objectId;
+      const subscriptionType = (ev.subscriptionType ?? "").toString().toLowerCase();
+
+      const isEmailish = subscriptionType.includes("email") || subscriptionType.includes("engagement");
+      if (!isEmailish || !objectId) continue;
+
+      // Try to resolve associated contact -> email (may need adjustment based on your exact webhook)
+      let contactEmail = null;
+
+      try {
+        const assocResp = await hs.get(`/crm/v3/objects/emails/${objectId}/associations/contacts`);
+        const contactIds = assocResp.data?.results?.map(r => r.id).filter(Boolean) ?? [];
+        if (contactIds.length) {
+          const cResp = await hs.get(`/crm/v3/objects/contacts/${contactIds[0]}`, {
+            params: { properties: "email" }
+          });
+          contactEmail = (cResp.data?.properties?.email ?? "").toString().trim().toLowerCase();
+        }
+      } catch (e) {
+        // This is expected until we confirm whether HubSpot is sending “emails” or “engagements”
+        continue;
+      }
+
+      if (!contactEmail) continue;
+
+      const tokenSet = deviceTokensByEmail.get(contactEmail);
+      if (!tokenSet || tokenSet.size === 0) continue;
+
+      await admin.messaging().sendEachForMulticast({
+        tokens: Array.from(tokenSet),
+        notification: {
+          title: "Gas Me Up Update",
+          body: "New HubSpot message/status update.",
+        },
+        data: { type: "hubspot_event", objectId: String(objectId) },
+      });
+    }
+  } catch (err) {
+    console.error("hubspot webhook error:", err?.response?.data || err?.message || err);
+  }
+});
+
 
 // =================== CONTACT CREATION / UPDATE ===================
 
