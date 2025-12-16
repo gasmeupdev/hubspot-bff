@@ -374,36 +374,46 @@ app.post("/vehicles/sync", async (req, res) => {
 
 // HubSpot webhook endpoint (configure URL in HubSpot):
 // https://hubspot-bff.onrender.com/hubspot/webhook
-app.post("/hubspot/webhook", async (req, res) => {
-  // Return 200 fast to avoid retries
+app.all("/hubspot/webhook", async (req, res) => {
+  // Always respond 200 immediately (HubSpot retries on non-2xx)
   res.status(200).json({ ok: true });
+
+  // Log method + URL so you can see if HubSpot is GET’ing you
+  console.log("HUBSPOT WEBHOOK HIT:", req.method, req.originalUrl);
 
   try {
     if (!admin.apps.length) return;
 
     const events = Array.isArray(req.body) ? req.body : [];
+    console.log("HUBSPOT BODY:", JSON.stringify(events, null, 2));
+
     for (const ev of events) {
-      // We will refine this once you paste one sample webhook payload
       const objectId = ev.objectId;
       const subscriptionType = (ev.subscriptionType ?? "").toString().toLowerCase();
 
-      const isEmailish = subscriptionType.includes("email") || subscriptionType.includes("engagement");
+      const isEmailish =
+        subscriptionType.includes("email") || subscriptionType.includes("engagement");
       if (!isEmailish || !objectId) continue;
 
-      // Try to resolve associated contact -> email (may need adjustment based on your exact webhook)
       let contactEmail = null;
 
       try {
-        const assocResp = await hs.get(`/crm/v3/objects/emails/${objectId}/associations/contacts`);
-        const contactIds = assocResp.data?.results?.map(r => r.id).filter(Boolean) ?? [];
+        const assocResp = await hs.get(
+          `/crm/v3/objects/emails/${objectId}/associations/contacts`
+        );
+        const contactIds =
+          assocResp.data?.results?.map((r) => r.id).filter(Boolean) ?? [];
+
         if (contactIds.length) {
           const cResp = await hs.get(`/crm/v3/objects/contacts/${contactIds[0]}`, {
-            params: { properties: "email" }
+            params: { properties: "email" },
           });
-          contactEmail = (cResp.data?.properties?.email ?? "").toString().trim().toLowerCase();
+          contactEmail = (cResp.data?.properties?.email ?? "")
+            .toString()
+            .trim()
+            .toLowerCase();
         }
-      } catch (e) {
-        // This is expected until we confirm whether HubSpot is sending “emails” or “engagements”
+      } catch {
         continue;
       }
 
@@ -425,6 +435,7 @@ app.post("/hubspot/webhook", async (req, res) => {
     console.error("hubspot webhook error:", err?.response?.data || err?.message || err);
   }
 });
+
 
 
 // =================== CONTACT CREATION / UPDATE ===================
