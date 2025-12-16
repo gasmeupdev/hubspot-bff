@@ -69,24 +69,62 @@ console.log("REGISTER PUSH TOKEN", { email, tokenCount: set.size });
 
 // POST /push/test  { email, title?, body? }
 app.post("/push/test", async (req, res) => {
-  if (!admin.apps.length) return res.status(500).json({ error: "firebase_admin_not_initialized" });
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ error: "firebase_admin_not_initialized" });
+    }
 
-  const email = (req.body?.email ?? "").toString().trim().toLowerCase();
-  const title = (req.body?.title ?? "Gas Me Up").toString();
-  const body = (req.body?.body ?? "Test push").toString();
+    const email = (req.body?.email ?? "").toString().trim().toLowerCase();
+    const title = (req.body?.title ?? "Gas Me Up").toString();
+    const body = (req.body?.body ?? "Test push").toString();
 
-  const set = deviceTokensByEmail.get(email);
-  if (!set || set.size === 0) return res.status(404).json({ error: "no_tokens_for_email" });
+    if (!email) return res.status(400).json({ error: "email required" });
 
-  const tokens = Array.from(set);
-  const resp = await admin.messaging().sendEachForMulticast({
-    tokens,
-    notification: { title, body },
-    data: { type: "test" },
-  });
+    const set = deviceTokensByEmail.get(email);
+    if (!set || set.size === 0) {
+      return res.status(404).json({ error: "no_tokens_for_email" });
+    }
 
-  return res.json({ ok: true, successCount: resp.successCount, failureCount: resp.failureCount });
+    const tokens = Array.from(set);
+
+    const resp = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      data: { type: "test" },
+    });
+
+    // Capture per-token errors so you can see the real reason for failureCount
+    const errors = resp.responses
+      .map((r, i) =>
+        r.success
+          ? null
+          : {
+              tokenPreview: tokens[i]?.slice(0, 18) + "...",
+              code: r.error?.code ?? null,
+              message: r.error?.message ?? null,
+            }
+      )
+      .filter(Boolean);
+
+    console.log("FCM /push/test result:", {
+      email,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      errors,
+    });
+
+    return res.json({
+      ok: true,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      errors,
+    });
+  } catch (err) {
+    console.error("POST /push/test error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
+  }
 });
+
 
 
 
