@@ -101,8 +101,15 @@ app.post("/push/register", (req, res) => {
 // POST /push/test  { email, title?, body? }
 app.post("/push/test", async (req, res) => {
   try {
+    // Always report current init state
+    const initState = {
+      adminAppsLength: admin.apps.length,
+      hasEnv: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON),
+    };
+
     if (!admin.apps.length) {
-      return res.status(500).json({ error: "firebase_admin_not_initialized" });
+      console.error("push/test blocked: firebase_admin_not_initialized", initState);
+      return res.status(500).json({ error: "firebase_admin_not_initialized", initState });
     }
 
     const email = (req.body?.email ?? "").toString().trim().toLowerCase();
@@ -112,16 +119,14 @@ app.post("/push/test", async (req, res) => {
     if (!email) return res.status(400).json({ error: "email required" });
 
     const set = deviceTokensByEmail.get(email);
-    if (!set || set.size === 0) {
-      return res.status(404).json({ error: "no_tokens_for_email" });
-    }
+    if (!set || set.size === 0) return res.status(404).json({ error: "no_tokens_for_email" });
 
     const tokens = Array.from(set);
 
     const resp = await admin.messaging().sendEachForMulticast({
       tokens,
       notification: { title, body },
-      data: { type: "test" }
+      data: { type: "test" },
     });
 
     const errors = resp.responses
@@ -131,29 +136,23 @@ app.post("/push/test", async (req, res) => {
           : {
               tokenPreview: (tokens[i] ?? "").slice(0, 18) + "...",
               code: r.error?.code ?? null,
-              message: r.error?.message ?? null
+              message: r.error?.message ?? null,
             }
       )
       .filter(Boolean);
-
-    console.log("FCM /push/test result:", {
-      email,
-      successCount: resp.successCount,
-      failureCount: resp.failureCount,
-      errors
-    });
 
     return res.json({
       ok: true,
       successCount: resp.successCount,
       failureCount: resp.failureCount,
-      errors
+      errors,
     });
   } catch (err) {
-    console.error("POST /push/test error:", err?.response?.data || err?.message || err);
+    console.error("POST /push/test error:", err?.message ?? err);
     return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
   }
 });
+
 
 
 
