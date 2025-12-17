@@ -157,6 +157,106 @@ app.post("/push/test", async (req, res) => {
 
 
 
+// HubSpot -> Push: Email Logged trigger (from HubSpot Workflow "Send a webhook")
+app.post("/hubspot/email-logged", async (req, res) => {
+  try {
+    // Optional shared secret (recommended)
+    // In HubSpot webhook action, add header: x-hubspot-push-secret: <value>
+    const expected = (process.env.HUBSPOT_PUSH_SECRET || "").trim();
+    if (expected) {
+      const provided = (req.header("x-hubspot-push-secret") || "").trim();
+      if (!provided || provided !== expected) {
+        console.warn("hubspot/email-logged blocked: bad_secret");
+        return res.status(401).json({ error: "unauthorized" });
+      }
+    }
+
+    // Safety: make sure firebase admin is initialized
+    const initState = {
+      adminAppsLength: admin.apps.length,
+      hasEnv: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON),
+    };
+    if (!admin.apps.length) {
+      console.error("hubspot/email-logged blocked: firebase_admin_not_initialized", initState);
+      return res.status(500).json({ error: "firebase_admin_not_initialized", initState });
+    }
+
+    // Accept a few possible payload shapes (HubSpot tokens vary)
+    const email = (
+      req.body?.contactEmail ??
+      req.body?.email ??
+      req.body?.properties?.email ??
+      ""
+    )
+      .toString()
+      .trim()
+      .toLowerCase();
+
+    // You can pass these from HubSpot if available; otherwise default
+    const subject = (req.body?.subject ?? req.body?.emailSubject ?? "New HubSpot email").toString();
+    const preview = (req.body?.preview ?? req.body?.body ?? req.body?.emailPreview ?? "").toString();
+
+    if (!email) {
+      // Always respond 200-ish to HubSpot when possible (prevents retries),
+      // but here we’ll be explicit
+      return res.status(400).json({ error: "contactEmail (or email) is required" });
+    }
+
+    const set = deviceTokensByEmail.get(email);
+    if (!set || set.size === 0) {
+      console.log("HUBSPOT EMAIL LOGGED: no_tokens_for_email", { email });
+      return res.json({ ok: true, status: "no_tokens_for_email", email });
+    }
+
+    const tokens = Array.from(set);
+
+    const title = "GMU";
+    const body = preview ? `${subject} — ${preview}`.slice(0, 180) : subject;
+
+    const resp = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      data: {
+        type: "hubspot_email_logged",
+        email,
+        subject,
+      },
+    });
+
+    // Log per-token failures for debugging
+    const errors = resp.responses
+      .map((r, i) =>
+        r.success
+          ? null
+          : {
+              tokenPreview: (tokens[i] ?? "").slice(0, 18) + "...",
+              code: r.error?.code ?? null,
+              message: r.error?.message ?? null,
+            }
+      )
+      .filter(Boolean);
+
+    console.log("HUBSPOT EMAIL LOGGED PUSH", {
+      email,
+      tokenCount: tokens.length,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      errorsCount: errors.length,
+    });
+
+    return res.json({
+      ok: true,
+      email,
+      tokenCount: tokens.length,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      errors,
+    });
+  } catch (err) {
+    console.error("POST /hubspot/email-logged error:", err?.message ?? err);
+    return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
+  }
+});
 
 
 
