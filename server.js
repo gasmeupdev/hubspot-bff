@@ -28,7 +28,6 @@ function parseServiceAccount(raw) {
 
   return obj;
 }
- JSON.parse(s);
 
 
 try {
