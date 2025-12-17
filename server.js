@@ -29,7 +29,7 @@ function parseServiceAccount(raw) {
   return obj;
 }
  JSON.parse(s);
-}
+
 
 try {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
