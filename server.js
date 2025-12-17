@@ -11,21 +11,24 @@ dotenv.config();
 // ========================== FIREBASE ADMIN (FCM PUSH) ===============================
 function parseServiceAccount(raw) {
   if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is missing");
-
   let s = raw.trim();
 
-  // Handle accidental wrapping quotes
-  if (
-    (s.startsWith('"') && s.endsWith('"')) ||
-    (s.startsWith("'") && s.endsWith("'"))
-  ) {
+  // unwrap accidental quotes
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1);
   }
 
-  // Normalize newlines if they got double-escaped
-  s = s.replace(/\\n/g, "\n");
+  // IMPORTANT: parse first
+  const obj = JSON.parse(s);
 
-  return JSON.parse(s);
+  // Then normalize private_key only (convert "\\n" to "\n")
+  if (typeof obj.private_key === "string") {
+    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+  }
+
+  return obj;
+}
+ JSON.parse(s);
 }
 
 try {
