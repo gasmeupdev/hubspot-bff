@@ -14,7 +14,7 @@ function parseServiceAccount(raw) {
 
   let s = raw.trim();
 
-  // If the JSON was pasted wrapped in quotes, unwrap it.
+  // Handle accidental wrapping quotes
   if (
     (s.startsWith('"') && s.endsWith('"')) ||
     (s.startsWith("'") && s.endsWith("'"))
@@ -22,8 +22,7 @@ function parseServiceAccount(raw) {
     s = s.slice(1, -1);
   }
 
-  // If \n got double-escaped, normalize.
-  // This also works fine if it’s already correct.
+  // Normalize newlines if they got double-escaped
   s = s.replace(/\\n/g, "\n");
 
   return JSON.parse(s);
@@ -37,7 +36,7 @@ try {
     credential: admin.credential.cert(serviceAccount),
   });
 
-  console.log("Firebase Admin initialized for project:", serviceAccount.project_id);
+  console.log("Firebase Admin initialized:", serviceAccount.project_id);
 } catch (e) {
   console.error("Firebase Admin init failed:", e.message);
 }
