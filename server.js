@@ -9,20 +9,42 @@ import admin from "firebase-admin";
 dotenv.config();
 
 // ========================== FIREBASE ADMIN (FCM PUSH) ===============================
-const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+function parseServiceAccount(raw) {
+  if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is missing");
 
-if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.warn("Missing FIREBASE_SERVICE_ACCOUNT_JSON (push disabled).");
-} else {
-  const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+  let s = raw.trim();
+
+  // If the JSON was pasted wrapped in quotes, unwrap it.
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1);
+  }
+
+  // If \n got double-escaped, normalize.
+  // This also works fine if it’s already correct.
+  s = s.replace(/\\n/g, "\n");
+
+  return JSON.parse(s);
+}
+
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const serviceAccount = parseServiceAccount(raw);
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
-  console.log("Firebase Admin initialized");
+
+  console.log("Firebase Admin initialized for project:", serviceAccount.project_id);
+} catch (e) {
+  console.error("Firebase Admin init failed:", e.message);
 }
 
 // In-memory tokens (OK for testing). Replace with DB later.
 const deviceTokensByEmail = new Map(); // emailLower -> Set(tokens)
+
 
 
 const app = express();
@@ -53,20 +75,30 @@ app.use(
 app.use(express.json());
 
 // POST /push/register  { email, fcmToken }
+// POST /push/register  { email, fcmToken }
 app.post("/push/register", (req, res) => {
   const email = (req.body?.email ?? "").toString().trim().toLowerCase();
   const fcmToken = (req.body?.fcmToken ?? "").toString().trim();
 
-  if (!email || !fcmToken) return res.status(400).json({ error: "email and fcmToken required" });
+  if (!email || !fcmToken) {
+    return res.status(400).json({ error: "email and fcmToken required" });
+  }
 
   const set = deviceTokensByEmail.get(email) ?? new Set();
   set.add(fcmToken);
   deviceTokensByEmail.set(email, set);
-console.log("REGISTER PUSH TOKEN", { email, tokenCount: set.size });
+
+  console.log("REGISTER PUSH TOKEN", {
+    email,
+    tokenCount: set.size,
+    tokenPreview: fcmToken.slice(0, 18) + "..."
+  });
 
   return res.json({ ok: true, email, tokenCount: set.size });
 });
 
+
+// POST /push/test  { email, title?, body? }
 // POST /push/test  { email, title?, body? }
 app.post("/push/test", async (req, res) => {
   try {
@@ -90,18 +122,17 @@ app.post("/push/test", async (req, res) => {
     const resp = await admin.messaging().sendEachForMulticast({
       tokens,
       notification: { title, body },
-      data: { type: "test" },
+      data: { type: "test" }
     });
 
-    // Capture per-token errors so you can see the real reason for failureCount
     const errors = resp.responses
       .map((r, i) =>
         r.success
           ? null
           : {
-              tokenPreview: tokens[i]?.slice(0, 18) + "...",
+              tokenPreview: (tokens[i] ?? "").slice(0, 18) + "...",
               code: r.error?.code ?? null,
-              message: r.error?.message ?? null,
+              message: r.error?.message ?? null
             }
       )
       .filter(Boolean);
@@ -110,20 +141,21 @@ app.post("/push/test", async (req, res) => {
       email,
       successCount: resp.successCount,
       failureCount: resp.failureCount,
-      errors,
+      errors
     });
 
     return res.json({
       ok: true,
       successCount: resp.successCount,
       failureCount: resp.failureCount,
-      errors,
+      errors
     });
   } catch (err) {
     console.error("POST /push/test error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
   }
 });
+
 
 
 
@@ -425,6 +457,9 @@ app.all("/hubspot/webhook", async (req, res) => {
 
     const events = Array.isArray(req.body) ? req.body : [];
     console.log("HUBSPOT BODY:", JSON.stringify(events, null, 2));
+    console.log("HUBSPOT WEBHOOK HIT:", req.method, req.originalUrl);
+console.log("HUBSPOT BODY:", JSON.stringify(events, null, 2));
+
 
     for (const ev of events) {
       const objectId = ev.objectId;
