@@ -190,68 +190,7 @@ app.post("/push/test", async (req, res) => {
 });
 
 // HubSpot sometimes pings endpoints with GET during validation/testing
-app.get("/hubspot/email-logged", (req, res) => {
-  console.log("HUBSPOT EMAIL LOGGED GET ping");
-  return res.status(200).send("ok");
-});
 
-
-// HubSpot -> Push: Email Logged trigger (from HubSpot Workflow "Send a webhook")
-app.post("/hubspot/email-logged", async (req, res) => {app.post("/hubspot/email-logged", async (req, res) => {
-  try {
-    console.log("HUBSPOT EMAIL LOGGED POST body:", req.body);
-
-    const email = (
-      req.body?.contactEmail ??
-      req.body?.email ??
-      req.body?.properties?.email ??
-      ""
-    ).toString().trim().toLowerCase();
-
-    if (!email) {
-      console.warn("HUBSPOT EMAIL LOGGED missing email");
-      return res.status(200).json({ ok: true, status: "missing_email" });
-    }
-
-    const set = deviceTokensByEmail.get(email);
-    if (!set || set.size === 0) {
-      console.log("HUBSPOT EMAIL LOGGED no tokens", { email });
-      return res.status(200).json({ ok: true, status: "no_tokens_for_email", email });
-    }
-
-    const tokens = Array.from(set);
-
-    const subject = (req.body?.subject ?? req.body?.emailSubject ?? "New HubSpot email").toString();
-    const preview = (req.body?.preview ?? req.body?.body ?? req.body?.emailPreview ?? "").toString();
-
-    const resp = await admin.messaging().sendEachForMulticast({
-      tokens,
-      notification: {
-        title: "GMU",
-        body: preview ? `${subject} — ${preview}`.slice(0, 180) : subject
-      },
-      data: { type: "hubspot_email_logged", email, subject }
-    });
-
-    console.log("HUBSPOT EMAIL LOGGED PUSH RESULT", {
-      email,
-      tokenCount: tokens.length,
-      successCount: resp.successCount,
-      failureCount: resp.failureCount
-    });
-
-    return res.status(200).json({
-      ok: true,
-      email,
-      tokenCount: tokens.length,
-      successCount: resp.successCount,
-      failureCount: resp.failureCount
-    });
-  } catch (err) {
-    console.error("POST /hubspot/email-logged error:", err?.message ?? err);
-    return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
-  }
-});
 
 
 
