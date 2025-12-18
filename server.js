@@ -546,61 +546,98 @@ console.log("HUBSPOT BODY:", JSON.stringify(events, null, 2));
 });
 
 // HubSpot sometimes "pings" endpoints with GET. Return 200 so validation passes.
-app.get("/hubspot/email-logged", (req, res) => {
-  console.log("HUBSPOT EMAIL LOGGED GET ping", { query: req.query });
-  return res.status(200).send("ok");
-});
-
 app.post("/hubspot/email-logged", async (req, res) => {
   try {
     console.log("HUBSPOT EMAIL LOGGED POST body:", req.body);
 
-    const email = (
-      req.body?.contactEmail ??
-      req.body?.email ??
-      req.body?.properties?.email ??
-      ""
-    ).toString().trim().toLowerCase();
-
-    if (!email) {
-      return res.status(400).json({ error: "contactEmail (or email) is required" });
+    // HubSpot sends an array of events
+    const event = Array.isArray(req.body) ? req.body[0] : req.body;
+    if (!event?.objectId || event?.objectTypeId !== "0-49") {
+      console.log("Not an email engagement event, ignoring");
+      return res.status(200).json({ ok: true, ignored: true });
     }
 
-    const set = deviceTokensByEmail.get(email);
-    if (!set || set.size === 0) {
-      console.log("HUBSPOT EMAIL LOGGED: no_tokens_for_email", { email });
-      return res.status(200).json({ ok: true, status: "no_tokens_for_email", email });
+    const emailObjectId = event.objectId;
+
+    // 1️⃣ Fetch email engagement details
+    const emailResp = await hs.get(
+      `/crm/v3/objects/0-49/${emailObjectId}`,
+      {
+        params: {
+          properties: "hs_email_subject,hs_email_text,hs_email_html"
+        }
+      }
+    );
+
+    const subject =
+      emailResp.data?.properties?.hs_email_subject ?? "New HubSpot email";
+
+    const bodyText =
+      emailResp.data?.properties?.hs_email_text ??
+      emailResp.data?.properties?.hs_email_html ??
+      "";
+
+    const preview = bodyText.replace(/<[^>]+>/g, "").slice(0, 160);
+
+    // 2️⃣ Find associated contacts
+    const assocResp = await hs.get(
+      `/crm/v4/objects/0-49/${emailObjectId}/associations/0-1`
+    );
+
+    const contactIds = assocResp.data?.results?.map(r => r.toObjectId) ?? [];
+
+    if (!contactIds.length) {
+      console.log("Email has no associated contacts");
+      return res.status(200).json({ ok: true, noContacts: true });
     }
 
-    const tokens = Array.from(set);
+    // 3️⃣ Fetch each contact email + send push
+    for (const contactId of contactIds) {
+      const contactResp = await hs.get(
+        `/crm/v3/objects/0-1/${contactId}`,
+        { params: { properties: "email" } }
+      );
 
-    const subject = (req.body?.subject ?? req.body?.emailSubject ?? "New HubSpot email").toString();
-    const preview = (req.body?.preview ?? req.body?.body ?? req.body?.emailPreview ?? "").toString();
+      const email =
+        contactResp.data?.properties?.email?.toLowerCase() ?? null;
 
-    const resp = await admin.messaging().sendEachForMulticast({
-      tokens,
-      notification: { title: "GMU", body: preview ? `${subject} — ${preview}`.slice(0, 180) : subject },
-      data: { type: "hubspot_email_logged", email, subject }
-    });
+      if (!email) continue;
 
-    console.log("HUBSPOT EMAIL LOGGED PUSH RESULT", {
-      email,
-      successCount: resp.successCount,
-      failureCount: resp.failureCount
-    });
+      const tokenSet = deviceTokensByEmail.get(email);
+      if (!tokenSet || tokenSet.size === 0) {
+        console.log("No tokens for contact", email);
+        continue;
+      }
 
-    return res.status(200).json({
-      ok: true,
-      email,
-      tokenCount: tokens.length,
-      successCount: resp.successCount,
-      failureCount: resp.failureCount
-    });
+      const tokens = Array.from(tokenSet);
+
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens,
+        notification: {
+          title: "Gas Me Up",              // ✅ always this
+          body: `${subject} — ${preview}`.slice(0, 180)
+        },
+        data: {
+          type: "hubspot_email_logged",
+          email,
+          hubspotEmailId: String(emailObjectId)
+        }
+      });
+
+      console.log("PUSH SENT", {
+        email,
+        successCount: resp.successCount,
+        failureCount: resp.failureCount
+      });
+    }
+
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("POST /hubspot/email-logged error:", err?.message ?? err);
-    return res.status(500).json({ error: "server_error", details: err?.message ?? String(err) });
+    console.error("POST /hubspot/email-logged error:", err);
+    return res.status(500).json({ error: "server_error" });
   }
 });
+
 
 
 // =================== CONTACT CREATION / UPDATE ===================
