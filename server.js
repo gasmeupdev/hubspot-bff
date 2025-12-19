@@ -593,6 +593,7 @@ console.log("HUBSPOT BODY:", JSON.stringify(events, null, 2));
 app.post("/hubspot/email-logged", async (req, res) => {
   try {
     console.log("HUBSPOT EMAIL LOGGED POST body:", req.body);
+console.log("HUBSPOT CONTACT EMAIL (lookup key):", contactEmail);
 
     // HubSpot sends an array of events
     const event = Array.isArray(req.body) ? req.body[0] : req.body;
