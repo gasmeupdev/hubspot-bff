@@ -4,6 +4,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import Stripe from "stripe";
 import admin from "firebase-admin";
+import pg from "pg";
+
 
 
 dotenv.config();
@@ -97,28 +99,68 @@ app.use(
 );
 app.use(express.json());
 
-// POST /push/register  { email, fcmToken }
-// POST /push/register  { email, fcmToken }
-app.post("/push/register", (req, res) => {
-  const email = (req.body?.email ?? "").toString().trim().toLowerCase();
-  const fcmToken = (req.body?.fcmToken ?? "").toString().trim();
 
-  if (!email || !fcmToken) {
-    return res.status(400).json({ error: "email and fcmToken required" });
-  }
+const { Pool } = pg;
 
-  const set = deviceTokensByEmail.get(email) ?? new Set();
-  set.add(fcmToken);
-  deviceTokensByEmail.set(email, set);
-
-  console.log("REGISTER PUSH TOKEN", {
-    email,
-    tokenCount: set.size,
-    tokenPreview: fcmToken.slice(0, 18) + "..."
-  });
-
-  return res.json({ ok: true, email, tokenCount: set.size });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
+
+async function upsertToken(email, token) {
+  await pool.query(
+    `
+    insert into push_tokens (email, token, updated_at)
+    values ($1, $2, now())
+    on conflict (token)
+    do update set email = excluded.email, updated_at = now()
+    `,
+    [email, token]
+  );
+}
+
+async function getTokensByEmail(email) {
+  const { rows } = await pool.query(
+    `select token from push_tokens where email = $1 order by updated_at desc`,
+    [email]
+  );
+  return rows.map(r => r.token);
+}
+
+async function deleteToken(token) {
+  await pool.query(`delete from push_tokens where token = $1`, [token]);
+}
+
+
+
+
+// POST /push/register  { email, fcmToken }
+// POST /push/register  { email, fcmToken }
+app.post("/push/register", async (req, res) => {
+  try {
+    const email = (req.body?.email ?? "").toString().trim().toLowerCase();
+
+    // Accept both keys to avoid breakage (iOS should send "token")
+    const token = (req.body?.token ?? req.body?.fcmToken ?? "").toString().trim();
+
+    if (!email || !token) {
+      return res.status(400).json({ error: "email and token required" });
+    }
+
+    await upsertToken(email, token);
+
+    console.log("REGISTER PUSH TOKEN (DB)", {
+      email,
+      tokenPreview: token.slice(0, 18) + "..."
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /push/register error:", err?.message ?? err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
 
 
 
@@ -154,10 +196,12 @@ app.post("/push/test", async (req, res) => {
 
     if (!email) return res.status(400).json({ error: "email required" });
 
-    const set = deviceTokensByEmail.get(email);
-    if (!set || set.size === 0) return res.status(404).json({ error: "no_tokens_for_email" });
+   const tokens = await getTokensByEmail(email);
 
-    const tokens = Array.from(set);
+if (!tokens.length) {
+  return res.status(404).json({ error: "no_tokens_for_email" });
+}
+
 
     const resp = await admin.messaging().sendEachForMulticast({
       tokens,
