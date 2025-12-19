@@ -645,6 +645,9 @@ app.post("/hubspot/email-logged", async (req, res) => {
       const email =
         contactResp.data?.properties?.email?.toLowerCase() ?? null;
 
+            console.log("HUBSPOT CONTACT EMAIL (lookup key):", email);
+
+      
       if (!email) continue;
 
       const tokenSet = deviceTokensByEmail.get(email);
@@ -653,7 +656,6 @@ app.post("/hubspot/email-logged", async (req, res) => {
         continue;
       }
 
-      console.log("HUBSPOT CONTACT EMAIL (lookup key):", email);
 
 
       const tokens = Array.from(tokenSet);
