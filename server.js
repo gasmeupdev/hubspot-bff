@@ -120,12 +120,21 @@ async function upsertToken(email, token) {
 }
 
 async function getTokensByEmail(email) {
+  const normEmail = String(email || "").trim().toLowerCase();
+
   const { rows } = await pool.query(
-    `select token from push_tokens where email = $1 order by updated_at desc`,
-    [email]
+    `
+    select token
+    from push_tokens
+    where lower(trim(email)) = $1
+    order by updated_at desc
+    `,
+    [normEmail]
   );
+
   return rows.map(r => r.token);
 }
+
 
 async function deleteToken(token) {
   await pool.query(`delete from push_tokens where token = $1`, [token]);
@@ -197,7 +206,9 @@ app.post("/push/test", async (req, res) => {
     if (!email) return res.status(400).json({ error: "email required" });
 
 
-let tokens = await getTokensByEmail(email);
+const normEmail = String(email || "").trim().toLowerCase();
+let tokens = await getTokensByEmail(normEmail);
+
 
 if (!tokens.length) {
   // small grace period in case token registration is happening at the same time
@@ -207,6 +218,12 @@ if (!tokens.length) {
 
 if (!tokens.length) {
   console.log("No tokens for contact", email);
+
+  console.log("EMAIL RAW:", email);
+console.log("EMAIL NORM:", String(email || "").trim().toLowerCase());
+console.log("TOKENS FOUND COUNT:", tokens.length);
+
+  
   return res.status(404).json({ error: "no_tokens_for_email" });
 }
 
