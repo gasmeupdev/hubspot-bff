@@ -196,11 +196,19 @@ app.post("/push/test", async (req, res) => {
 
     if (!email) return res.status(400).json({ error: "email required" });
 
-   const tokens = await getTokensByEmail(email);
+   let tokens = await getTokensByEmail(contactEmail);
 
 if (!tokens.length) {
-  return res.status(404).json({ error: "no_tokens_for_email" });
+  // ✅ small grace period in case token registration is happening at the same time
+  await new Promise(r => setTimeout(r, 1500));
+  tokens = await getTokensByEmail(contactEmail);
 }
+
+if (!tokens.length) {
+  console.log("No tokens for contact", contactEmail);
+  continue;
+}
+
 
 
     const resp = await admin.messaging().sendEachForMulticast({
