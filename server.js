@@ -199,16 +199,12 @@ app.post("/push/test", async (req, res) => {
 
 let tokens = await getTokensByEmail(email);
 
+const tokens = await getTokensByEmail(contactEmail);
 if (!tokens.length) {
-  // ✅ small grace period in case token registration is happening at the same time
-  await new Promise(r => setTimeout(r, 1500));
-  tokens = await getTokensByEmail(email);
-}
-
-if (!tokens.length) {
-  console.log("No tokens for contact", email);
+  console.log("No tokens for contact", contactEmail);
   continue;
 }
+
 
 
 
