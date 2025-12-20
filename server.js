@@ -680,15 +680,26 @@ app.post("/hubspot/email-logged", async (req, res) => {
       
       if (!email) continue;
 
-      const tokenSet = deviceTokensByEmail.get(email);
-      if (!tokenSet || tokenSet.size === 0) {
-        console.log("No tokens for contact", email);
-        continue;
-      }
+      
+
+
+      let tokens = await getTokensByEmail(email);
+
+if (!tokens.length) {
+  // ✅ small grace period in case token registration is happening at the same time
+  await new Promise(r => setTimeout(r, 1500));
+  tokens = await getTokensByEmail(email);
+}
+
+if (!tokens.length) {
+  console.log("No tokens for contact", email);
+  continue;
+}
 
 
 
-      const tokens = Array.from(tokenSet);
+
+      //const tokens = Array.from(tokenSet);
 
       const resp = await admin.messaging().sendEachForMulticast({
         tokens,
