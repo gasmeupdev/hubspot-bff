@@ -197,7 +197,6 @@ app.post("/push/test", async (req, res) => {
     if (!email) return res.status(400).json({ error: "email required" });
 
 
-let tokens = await getTokensByEmail(email);
 
 const tokens = await getTokensByEmail(contactEmail);
 if (!tokens.length) {
