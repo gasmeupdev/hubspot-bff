@@ -647,7 +647,7 @@ app.post("/hubspot/email-logged", async (req, res) => {
     );
 
     const subject =
-      emailResp.data?.properties?.hs_email_subject ?? "New HubSpot email";
+      emailResp.data?.properties?.hs_email_subject ?? " ";
 
     const bodyText =
       emailResp.data?.properties?.hs_email_text ??
