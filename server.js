@@ -57,6 +57,9 @@ app.use((req, res, next) => {
   next();
 });
 
+
+
+
 // ---- Body parsers (HubSpot can send JSON or form-encoded)
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ type: ["application/json", "application/*+json"] }));
@@ -1084,6 +1087,42 @@ app.post('/truck/location', (req, res) => {
 
 //stripe-refill-payment
 
+
+// ✅ Mark HubSpot subscriber ONLY after payment is confirmed succeeded
+app.post("/stripe/confirm-subscription-success", async (req, res) => {
+  try {
+    const { email, paymentIntentClientSecret } = req.body || {};
+    if (!email || !paymentIntentClientSecret) {
+      return res.status(400).json({ error: "Missing email or paymentIntentClientSecret" });
+    }
+
+    // paymentIntentClientSecret looks like: "pi_12345_secret_abcdef"
+    const paymentIntentId = String(paymentIntentClientSecret).split("_secret_")[0];
+    if (!paymentIntentId.startsWith("pi_")) {
+      return res.status(400).json({ error: "Invalid paymentIntentClientSecret" });
+    }
+
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
+
+    // Ask Stripe for the truth
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (pi.status !== "succeeded") {
+      return res.status(409).json({ error: `Payment not succeeded (status=${pi.status})` });
+    }
+
+    // ✅ Now (and only now) update HubSpot
+    await markContactAsSubscriberByEmail(email);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("confirm-subscription-success error:", err);
+    return res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+
+
 app.post("/stripe/init-refill-payment", async (req, res) => {
   try {
     if (!stripe) {
@@ -1308,7 +1347,7 @@ app.post("/stripe/init-subscription-payment", async (req, res) => {
     });
 
     // Mark HubSpot contact as subscriber (jobtitle = "1") after payment intent creation
-    await markContactAsSubscriberByEmail(email);
+    //await markContactAsSubscriberByEmail(email);
 
     return res.json({
       email,
