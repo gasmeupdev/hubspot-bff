@@ -203,8 +203,11 @@ app.post("/push/test", async (req, res) => {
     }
 
     const email = (req.body?.email ?? "").toString().trim().toLowerCase();
-    const title = (req.body?.title ?? "Gas Me Up").toString();
-    const body = (req.body?.body ?? "Test push").toString();
+    const rawTitle = (req.body?.title ?? "").toString().trim();
+const rawBody  = (req.body?.body  ?? "").toString().trim();
+
+const title = rawTitle.length > 0 ? rawTitle : "Gas Me Up";
+const body  = rawBody.length  > 0 ? rawBody  : "Test push";
 
     if (!email) return res.status(400).json({ error: "email required" });
 
