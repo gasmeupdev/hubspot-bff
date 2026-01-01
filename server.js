@@ -711,7 +711,7 @@ if (!tokens.length) {
         tokens,
         notification: {
           title: "Gas Me Up",              // ✅ always this
-          body: `${subject} — ${preview}`.slice(0, 180)
+          body: `${preview}`.slice(0, 180)
         },
         data: {
           type: "hubspot_email_logged",
