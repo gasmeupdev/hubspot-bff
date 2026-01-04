@@ -1236,7 +1236,7 @@ app.post("/stripe/init-refill-payment", async (req, res) => {
 
 app.post("/refills/update", async (req, res) => {
   try {
-    const { taskId, subject, body, cancel } = req.body || {};
+const { taskId, subject, body, scheduledAt, cancel } = req.body || {};
 
     if (!taskId) {
       return res.status(400).json({ error: "taskId is required" });
@@ -1251,6 +1251,11 @@ app.post("/refills/update", async (req, res) => {
     if (typeof body === "string") {
       properties.hs_task_body = body;
     }
+
+    if (typeof scheduledAt === "string" && scheduledAt.trim()) {
+  properties.hs_timestamp = scheduledAt.trim();
+}
+
 
     // If this is a cancel action, mark the HubSpot task as canceled.
     const isCancel =
