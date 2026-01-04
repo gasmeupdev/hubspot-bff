@@ -792,11 +792,21 @@ app.post("/contacts", async (req, res) => {
       id: createResp.data?.id,
     });
   } catch (err) {
-    const status = err.response?.status || 500;
-    const details = err.response?.data || err.message;
-    console.error("POST /contacts error:", details);
-    return res.status(status).json({ success: false, error: details });
-  }
+  const status = err.response?.status || 500;
+  const data = err.response?.data;
+
+  // Always return a string message (iOS-friendly)
+  const details =
+    typeof data === "string"
+      ? data
+      : data
+      ? JSON.stringify(data)
+      : (err.message || "Unknown server error");
+
+  console.error("POST /contacts error:", status, details);
+  return res.status(status).json({ success: false, error: details });
+}
+
 });
 
 app.get("/contacts/status", async (req, res) => {
