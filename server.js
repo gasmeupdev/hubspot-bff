@@ -285,6 +285,22 @@ const hs = axios.create({
   timeout: 20000,
 });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function hsPostWithRetry(path, payload) {
+  try {
+    return await hs.post(path, payload);
+  } catch (err) {
+    if (err.response?.status === 429) {
+      // simple backoff and retry once
+      await sleep(1200);
+      return await hs.post(path, payload);
+    }
+    throw err;
+  }
+}
+
+
 // Helper: get contact by email
 async function getContactByEmail(email) {
   const resp = await hs.post("/crm/v3/objects/contacts/search", {
@@ -776,21 +792,48 @@ app.post("/contacts", async (req, res) => {
       });
     }
 
-    const createResp = await hs.post("/crm/v3/objects/contacts", {
-      properties: {
-        email,
-        firstname: firstName,
-        lastname: lastName,
-        phone,
-        jobtitle: jobTitle,
-      },
-    });
+ try {
+  const createResp = await hsPostWithRetry("/crm/v3/objects/contacts", {
+    properties: {
+      email,
+      firstname: firstName,
+      lastname: lastName,
+      phone,
+      jobtitle: jobTitle,
+    },
+  });
 
-    return res.json({
-      success: true,
-      mode: "created",
-      id: createResp.data?.id,
-    });
+  return res.json({
+    success: true,
+    mode: "created",
+    id: createResp.data?.id,
+  });
+
+} catch (err) {
+  if (err.response?.status === 409) {
+    // Contact already exists — fetch and update instead of failing
+    const existing2 = await getContactByEmail(email);
+    if (existing2?.id) {
+      const updateResp = await hs.patch(`/crm/v3/objects/contacts/${existing2.id}`, {
+        properties: {
+          email,
+          firstname: firstName,
+          lastname: lastName,
+          phone,
+          jobtitle: jobTitle,
+        },
+      });
+
+      return res.json({
+        success: true,
+        mode: "updated_after_409",
+        id: updateResp.data?.id,
+      });
+    }
+  }
+  throw err; // handled by your outer catch at the bottom
+}
+
   } catch (err) {
   const status = err.response?.status || 500;
   const data = err.response?.data;
