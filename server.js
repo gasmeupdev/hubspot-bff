@@ -1250,9 +1250,32 @@ const { taskId, body, scheduledAt, vehicle, cancel } = req.body || {};
       properties.hs_task_body = body;
     }
 
-    if (typeof scheduledAt === "string" && scheduledAt.trim()) {
-  properties.hs_timestamp = scheduledAt.trim();
+    // HubSpot expects hs_timestamp as milliseconds since epoch
+if (scheduledAt != null) {
+  let tsMs = null;
+
+  // If app sends a number (or numeric string), accept it
+  if (typeof scheduledAt === "number" && Number.isFinite(scheduledAt)) {
+    tsMs = scheduledAt;
+  } else if (typeof scheduledAt === "string" && scheduledAt.trim()) {
+    const raw = scheduledAt.trim();
+
+    // numeric string?
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw);
+      if (Number.isFinite(n)) tsMs = n;
+    } else {
+      // ISO string -> ms
+      const parsed = Date.parse(raw);
+      if (!Number.isNaN(parsed)) tsMs = parsed;
+    }
+  }
+
+  if (tsMs != null) {
+    properties.hs_timestamp = tsMs;
+  }
 }
+
 
     const vehicleName = (vehicle?.name ?? "").toString().trim();
 const vehiclePlate = (vehicle?.plate ?? "").toString().trim();
