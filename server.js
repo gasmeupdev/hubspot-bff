@@ -1236,7 +1236,7 @@ app.post("/stripe/init-refill-payment", async (req, res) => {
 
 app.post("/refills/update", async (req, res) => {
   try {
-const { taskId, body, scheduledAt, vehicle, cancel } = req.body || {};
+const { taskId, subject, body, scheduledAt, vehicle, cancel } = req.body || {};
 
     if (!taskId) {
       return res.status(400).json({ error: "taskId is required" });
@@ -1277,13 +1277,22 @@ if (scheduledAt != null) {
 }
 
 
-    const vehicleName = (vehicle?.name ?? "").toString().trim();
+  const vehicleName = (vehicle?.name ?? "").toString().trim();
 const vehiclePlate = (vehicle?.plate ?? "").toString().trim();
 
+const cleanSubject =
+  typeof subject === "string" ? subject.trim() : "";
+
+// Priority:
+// 1) subject sent from the iOS app (already includes vehicle name)
+// 2) computed fallback from vehicle payload
 const computedSubject =
-  vehicleName || vehiclePlate
+  cleanSubject ||
+  (vehicleName || vehiclePlate
     ? `Refill request - ${vehicleName || vehiclePlate}`
-    : "Refill request";
+    : "Refill request");
+
+
 
 // Always set subject from computed value on update
 properties.hs_task_subject = computedSubject;
