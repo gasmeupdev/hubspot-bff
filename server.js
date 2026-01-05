@@ -1236,7 +1236,7 @@ app.post("/stripe/init-refill-payment", async (req, res) => {
 
 app.post("/refills/update", async (req, res) => {
   try {
-const { taskId, subject, body, scheduledAt, cancel } = req.body || {};
+const { taskId, body, scheduledAt, vehicle, cancel } = req.body || {};
 
     if (!taskId) {
       return res.status(400).json({ error: "taskId is required" });
@@ -1244,9 +1244,7 @@ const { taskId, subject, body, scheduledAt, cancel } = req.body || {};
 
     const properties = {};
 
-    if (typeof subject === "string") {
-      properties.hs_task_subject = subject;
-    }
+
 
     if (typeof body === "string") {
       properties.hs_task_body = body;
@@ -1255,6 +1253,19 @@ const { taskId, subject, body, scheduledAt, cancel } = req.body || {};
     if (typeof scheduledAt === "string" && scheduledAt.trim()) {
   properties.hs_timestamp = scheduledAt.trim();
 }
+
+    const vehicleName = (vehicle?.name ?? "").toString().trim();
+const vehiclePlate = (vehicle?.plate ?? "").toString().trim();
+
+const computedSubject =
+  vehicleName || vehiclePlate
+    ? `Refill request - ${vehicleName || vehiclePlate}`
+    : "Refill request";
+
+// Always set subject from computed value on update
+properties.hs_task_subject = computedSubject;
+
+    
 
 
     // If this is a cancel action, mark the HubSpot task as canceled.
