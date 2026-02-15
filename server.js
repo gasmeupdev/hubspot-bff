@@ -425,6 +425,86 @@ app.get("/vehicles", async (req, res) => {
 
 );
 
+// -----------------------------------------------------
+// BLACKOUT DATES (CALLS on special contact)
+// -----------------------------------------------------
+// Blackout dates are defined as HubSpot "Call" records associated to the contact
+// with email: gmublackoutdate@gmublackoutdate.com
+// Each call's hs_timestamp is interpreted in America/New_York and returned as YYYY-MM-DD.
+
+const BLACKOUT_DATES_EMAIL = "gmublackoutdate@gmublackoutdate.com";
+
+function formatYMDInNY(dateObj) {
+  // "en-CA" yields YYYY-MM-DD format reliably
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(dateObj);
+}
+
+// GET /blackout-dates
+// Returns: { blackoutDates: ["2026-03-01", ...], contactId, count }
+app.get("/blackout-dates", async (req, res) => {
+  try {
+    const contact = await getContactByEmail(BLACKOUT_DATES_EMAIL);
+    if (!contact || !contact.id) {
+      return res.json({ blackoutDates: [], contactId: null, count: 0 });
+    }
+
+    const contactId = contact.id;
+
+    // 1) Find associated call IDs
+    const assocResp = await hs.get(
+      `/crm/v3/objects/contacts/${contactId}/associations/calls`
+    );
+
+    const callIds =
+      assocResp.data?.results?.map((r) => r.id).filter(Boolean) || [];
+
+    if (!callIds.length) {
+      return res.json({ blackoutDates: [], contactId, count: 0 });
+    }
+
+    // 2) Batch read calls to get hs_timestamp
+    const batchResp = await hs.post("/crm/v3/objects/calls/batch/read", {
+      properties: ["hs_timestamp"],
+      inputs: callIds.map((id) => ({ id })),
+    });
+
+    const calls = batchResp.data?.results || [];
+    const set = new Set();
+
+    for (const c of calls) {
+      const raw = c.properties?.hs_timestamp;
+      if (!raw) continue;
+
+      let dt = null;
+
+      // HubSpot date properties are often epoch-ms strings
+      if (/^\d+$/.test(String(raw))) {
+        dt = new Date(Number(raw));
+      } else {
+        dt = new Date(String(raw));
+      }
+
+      if (!dt || isNaN(dt.getTime())) continue;
+
+      set.add(formatYMDInNY(dt));
+    }
+
+    const blackoutDates = Array.from(set).sort();
+
+    return res.json({ blackoutDates, contactId, count: blackoutDates.length });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || err.message;
+    console.error("GET /blackout-dates error:", data);
+    return res.status(status).json({ error: "server_error", details: data });
+  }
+});
+
 // Create a note; always ensure hs_note_body is a plain JSON string
 async function createNote(body) {
   const textBody = typeof body === "string" ? body : JSON.stringify(body);
