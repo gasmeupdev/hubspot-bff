@@ -300,6 +300,47 @@ async function hsPostWithRetry(path, payload) {
   }
 }
 
+// ======================= MAINTENANCE MODE (Marketing Events gate) =======================
+// If HubSpot contains at least 1 Marketing Event, the app is locked.
+//
+// Endpoint used by iOS app:
+//   GET /maintenance/status
+//
+// HubSpot API used:
+//   GET /marketing/v3/marketing-events/?limit=1
+app.get("/maintenance/status", async (req, res) => {
+  try {
+    // Only need 1 result to know whether any exist
+    const resp = await hs.get("/marketing/v3/marketing-events/", {
+      params: { limit: 1 },
+    });
+
+    const count = Array.isArray(resp.data?.results) ? resp.data.results.length : 0;
+    const maintenance = count > 0;
+
+    return res.json({
+      maintenance,
+      count,
+      title: "Temporarily Unavailable",
+      message: maintenance
+        ? "Gas Me Up is currently undergoing scheduled maintenance and is temporarily unavailable. Please log out and try again later. We apologize for the inconvenience."
+        : null,
+    });
+  } catch (err) {
+    // IMPORTANT: fail OPEN so a temporary HubSpot error doesn't brick the whole app
+    const status = err.response?.status;
+    const details = err.response?.data || err.message;
+    console.error("GET /maintenance/status error:", status, details);
+
+    return res.json({
+      maintenance: false,
+      count: 0,
+      title: null,
+      message: null,
+      error: "maintenance_check_failed",
+    });
+  }
+});
 
 // Helper: get contact by email
 async function getContactByEmail(email) {
