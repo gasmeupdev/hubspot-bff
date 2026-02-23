@@ -1027,8 +1027,8 @@ app.post("/refills/book", async (req, res) => {
       .toString()
       .trim();
     const scheduledAt = (req.body?.scheduledAt ?? "").toString().trim();
-    const vehicle = req.body?.vehicle || {};
-
+const vehicle = req.body?.vehicle || {};
+const psiCheckRequested = Boolean(req.body?.psiCheck);
     if (!email || !serviceLocation || !scheduledAt) {
       return res.status(400).json({
         error: "email, serviceLocation, and scheduledAt are required",
@@ -1039,15 +1039,20 @@ app.post("/refills/book", async (req, res) => {
     if (!contact || !contact.id) {
       return res.status(404).json({ error: "contact_not_found" });
     }
+    const isSubscriber = String(contact.properties?.jobtitle || "").trim() === "1";
+const psiCheck = isSubscriber && psiCheckRequested;
 
     const vehicleName = (vehicle.name ?? "").toString().trim();
     const vehiclePlate = (vehicle.plate ?? "").toString().trim();
     const vehicleColor = (vehicle.color ?? "").toString().trim();
 
-    const subject =
-      vehicleName || vehiclePlate
-        ? `Refill request - ${vehicleName || vehiclePlate}`
-        : "Refill request";
+    const vehicleLabel = [vehicleName, vehiclePlate]
+  .map((v) => (v || "").toString().trim())
+  .filter(Boolean)
+  .join(" ");
+
+let subject = vehicleLabel ? `Refill request - ${vehicleLabel}` : "Refill request";
+if (psiCheck) subject += " - PSI CHECK";
 
     const bodyLines = [
       "New refill request from iOS app.",
